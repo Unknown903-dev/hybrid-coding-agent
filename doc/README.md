@@ -1,6 +1,6 @@
-# Hybrid Coding Agent — Milestone 6C.1
+# Hybrid Coding Agent — Milestone 6C.2
 
-This project connects a **read-only Cloud Codex supervisor**, a direct **local Ollama proposal/repair worker**, and a **TypeScript policy and execution orchestrator**. Milestone 6A provides one explicitly authorized end-to-end command for a single eligible existing-file task; Milestone 6B adds explicit human approval and controlled application of the exact reviewed patch; Milestone 6C.1 adds sequential execution of two to five independent existing-file tasks in one isolated worktree. It does not execute dependent tasks, run tasks in parallel, commit, push, merge, deploy, or perform cloud coding.
+This project connects a **read-only Cloud Codex supervisor**, a direct **local Ollama proposal/repair worker**, and a **TypeScript policy and execution orchestrator**. Milestone 6A provides one explicitly authorized end-to-end command for a single eligible existing-file task; Milestone 6B adds explicit human approval and controlled application of the exact reviewed patch; Milestone 6C.1 adds sequential execution of two to five independent existing-file tasks in one isolated worktree; and Milestone 6C.2 extends the same signed approval and transactional integration path to their combined patches. It does not execute dependent tasks, run tasks in parallel, commit, push, merge, deploy, or perform cloud coding.
 
 ## Prerequisites
 
@@ -83,7 +83,7 @@ Conventional repository-wide validation commands are not assumed safe as per-tas
 
 One combined Git diff, one combined execution report, and one final Cloud supervisor review are produced. Planning and final review share the normal two-call default budget; there is no per-task cloud review or cloud coding fallback. Reports record execution order, task/file scopes, proposal and report references, per-task repair/check outcomes, combined checks, patch SHA-256, Cloud usage/review, worktree cleanup state, and human-approval availability.
 
-For Milestone 6C.1, combined multi-file patches are deliberately **review-only**. `run inspect` displays the complete combined patch and marks it ineligible for signed approval. The Milestone 6B approval/integration path remains restricted to one existing file, so partial or weakened multi-file integration is impossible. Apply multi-file patches manually only after your own review, or wait for a later transactional multi-file integration milestone.
+Combined patches covering two to five authorized files use the same `run inspect`, `run approve`, and `run integrate` workflow as single-file runs. Approval becomes eligible only after all task outcomes and final trusted checks pass and the Cloud review verdict is `ready_for_human_review`. File creation, deletion, rename, copy, binary, mode-changing, and submodule patches remain unsupported.
 
 ### Orchestration reports and recovery
 
@@ -100,7 +100,7 @@ git apply --stat .agent-runs/<execution-task-id>.patch
 
 ### Inspect, approve, and integrate a patch
 
-Inspection is read-only and prints the original request, authorized file, diff counts, complete patch, validation outcome, Cloud review, warnings, usage, patch SHA-256, and approval eligibility:
+Inspection is read-only and prints the original request, all selected tasks, execution order, exact changed-file list, per-task outcomes, final trusted validation, diff counts, complete combined patch, Cloud review, warnings, usage, patch SHA-256, and approval eligibility:
 
 ```sh
 npm run dev -- run inspect --project /path/to/repository --run-id <run-id>
@@ -112,7 +112,7 @@ Approval requires either typing `approve` at an interactive terminal or passing 
 npm run dev -- run approve --project /path/to/repository --run-id <run-id> --yes
 ```
 
-Approval requires passing trusted checks and a `ready_for_human_review` review artifact. It revalidates the run, execution report, review, protected path, original source digest, and patch applicability. It records the exact patch hash, repository identity, `HEAD`, source digest, artifact hashes, timestamp, and authorization method under `.agent-state/approvals/`. Approval does not modify source and remains a human decision—not proof of correctness.
+Approval requires passing trusted checks and a `ready_for_human_review` review artifact. It revalidates the run, execution/validation report, review, protected paths, every original source digest, exact changed-file set, and patch applicability. Its HMAC-signed record binds the exact combined patch hash, sorted file list, repository identity, `HEAD`, every source digest, artifact hashes, timestamp, and authorization method under `.agent-state/approvals/`. Approval neither modifies nor stages source and remains a human decision—not proof of correctness. Older signed single-file records remain accepted by the same path.
 
 Apply that exact approved patch to the original working tree with:
 
@@ -120,9 +120,11 @@ Apply that exact approved patch to the original working tree with:
 npm run dev -- run integrate --project /path/to/repository --run-id <run-id>
 ```
 
-Integration verifies the signed approval, artifact hashes, patch hash, repository identity, unchanged `HEAD`, clean tracked working tree/index, unchanged target digest, protected-path policy, exact one-file scope, and `git apply --check`. It acquires the same per-target lock as worktree execution, applies without shell interpolation, then requires the resulting working-tree diff to exactly equal the approved patch. It creates no commit and performs no merge, push, or deployment.
+Integration verifies the signed approval, artifact hashes, patch hash, repository identity, unchanged `HEAD`, clean tracked working tree/index, every unchanged target digest, protected-path policy, exact one-to-five-file scope, and `git apply --check`. It acquires all per-target locks in sorted order to prevent overlapping integrations without deadlock, then revalidates the run and repository state. A private verified patch copy closes the ordinary artifact replacement window. Application uses no shell interpolation and must produce exactly the approved changed-file set and byte-for-byte Git diff. Changes remain unstaged; integration creates no commit and performs no merge, push, or deployment.
 
-The original authorized file is buffered before application. If application or post-application verification fails, the coordinator restores that file and records a failed integration audit. Successful and failed audit records are separately HMAC-signed under `.agent-state/integrations/`; a successful run cannot be integrated twice.
+Every authorized source file is buffered before application. If application or post-application verification fails, the coordinator restores all verified snapshots and any unexpected tracked change, then verifies source digests and a clean working tree. A rollback that cannot be verified is reported as `manual_recovery_required` with affected paths; it is never reported as success. Successful and failed audit records are atomically written and separately HMAC-signed under `.agent-state/integrations/`. They include original/resulting source hashes, `HEAD`, timestamps, rollback state, and explicit false commit/push/merge/deployment flags. A successful run cannot be integrated twice.
+
+This is handled-failure atomicity, not durable crash consistency. Process termination, machine failure, filesystem faults, or an external process that ignores the orchestrator's locks can interrupt application or rollback. Inspect `git status`, `git diff`, and the signed audit records before recovery; do not retry blindly when manual recovery is reported. User-created worktrees are not removed.
 
 #### Local integrity threat model
 
@@ -145,7 +147,7 @@ Create a disposable Git repository with an initial commit, one existing source f
 
 ## Next milestones
 
-1. Transactional signed approval and integration for combined multi-file patches.
+1. Durable crash-recovery journaling for patch integration.
 2. Dependent-task scheduling, parallel execution, and separately authorized remote integration.
 
 ## Security
@@ -369,7 +371,7 @@ Cloud-hosted inference may consume OpenAI-hosted usage and requires Codex authen
 - Formatting-only detection compares non-whitespace content and is intentionally heuristic.
 - Diff size is a review signal; task-to-diff relevance still requires a human or supervisor.
 - The validator does not run model-proposed commands, compilers, linters, or tests.
-- Execution supports one existing file and trusted checks; it does not merge accepted changes back into the original tree.
+- Individual local proposals still target one existing file; multi-task orchestration combines two to five such bounded proposals before review.
 - Each proposal targets one existing regular file; file creation, deletion, and multi-file proposals are not supported.
 - A process crash may leave an owned worktree or lock for manual inspection; the executor never prunes unknown worktrees or guesses that another process is dead.
 - Supervisor planning and review remain read-only. The explicitly authorized `run` workflow coordinates one local task but never performs cloud takeover, merging, or deployment.
@@ -378,10 +380,9 @@ Cloud-hosted inference may consume OpenAI-hosted usage and requires Codex authen
 - Default single-task mode still supports exactly one dependency-free existing-file task; create/delete work remains blocked.
 - Sequential multi-task mode supports two to five dependency-free tasks on distinct existing files. Dependencies, overlapping scopes, partial-plan execution, and parallelism are rejected.
 - A Cloud review verdict is advisory. It never starts another repair loop, cloud coding task, merge, commit, push, or deployment.
-- Approval/integration currently supports the same single existing text file as Milestone 6A; binary, mode-changing, rename, creation, and deletion patches are rejected.
-- Integration intentionally leaves the approved change unstaged in the original working tree for manual review and commit.
-- Combined multi-task patches are review-only in Milestone 6C.1 and cannot use signed `run approve` or `run integrate`.
-- Git patch application plus in-process restoration prevents partial-file results during handled failures. An uncatchable process termination or machine failure can still leave the complete approved working-tree diff without a final audit; inspect `git diff` and the local audit directory before retrying.
+- Approval/integration supports one to five existing text files. Binary, submodule, mode-changing, rename, copy, creation, and deletion patches are rejected.
+- Integration intentionally leaves every approved change unstaged in the original working tree for manual review and commit.
+- Git patch application plus verified in-process restoration prevents partial-file results during handled failures. It cannot guarantee atomicity across an uncatchable process termination, machine failure, filesystem failure, or concurrent external writer outside the locking protocol; inspect `git status`, `git diff`, and `.agent-state/integrations/` before recovery.
 
 Run project checks with:
 
