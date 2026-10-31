@@ -14,6 +14,7 @@ import type { ImplementationPlan } from './supervisor/schemas.js';
 import { runOrchestration } from './orchestration/run-coordinator.js';
 import type { OrchestrationReport } from './orchestration/schemas.js';
 import { approveOrchestrationRun, inspectOrchestrationRun, integrateApprovedRun, type RunInspection } from './orchestration/integration.js';
+import { runMultiTaskOrchestration } from './orchestration/multi-run-coordinator.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -37,6 +38,7 @@ const usage = `Usage:
   npm run dev -- repair --project /path/to/repo --proposal .agent-proposals/proposal.json --apply --keep-worktree
   npm run dev -- run --project /path/to/repo --task "bounded change" --allow-cloud --apply
   npm run dev -- run --project /path/to/repo --task "bounded change" --allow-cloud --dry-run
+  npm run dev -- run --project /path/to/repo --task "several independent changes" --multi-task --max-tasks 3 --allow-cloud --apply
   npm run dev -- run inspect --project /path/to/repo --run-id <run-id>
   npm run dev -- run approve --project /path/to/repo --run-id <run-id> --yes
   npm run dev -- run integrate --project /path/to/repo --run-id <run-id>
@@ -126,12 +128,19 @@ function printOrchestrationReport(report: OrchestrationReport, path: string): vo
   console.log(`Orchestration state: ${report.state}`);
   console.log(`Run ID: ${report.run_id}`);
   if (report.selected_task) console.log(`Selected task: ${report.selected_task.task_id} (${report.selected_task.file_scope.join(', ')})`);
+  for (const selected of report.selected_tasks ?? []) console.log(`Selected task: ${selected.task_id} (${selected.file_scope.join(', ')})`);
+  for (const result of report.task_results ?? []) {
+    console.log(`TASK ${result.order} ${result.task_id}: ${result.status}, proposal ${result.proposal_validation}, checks ${result.automated_checks}, repairs ${result.repair_attempts}`);
+  }
   console.log(`Plan validation: ${report.validation.plan}`);
   console.log(`Proposal validation: ${report.validation.proposal}`);
   console.log(`Automated checks: ${report.validation.automated_checks}`);
   console.log(`Cloud calls: ${report.cloud_usage.calls_started}/${report.cloud_usage.call_budget}`);
   console.log(`Cloud review: ${report.final_review.status}${report.final_review.verdict ? ` (${report.final_review.verdict})` : ''}`);
   if (report.final_patch_path) console.log(`Reviewable patch: ${report.final_patch_path}`);
+  if (report.final_patch_sha256) console.log(`Combined patch SHA-256: ${report.final_patch_sha256}`);
+  if (report.worktree) console.log(`Worktree: ${report.worktree.location} (${report.worktree.preserved ? 'preserved' : report.worktree.cleaned ? 'cleaned' : 'active'})`);
+  if (report.human_approval_status) console.log(`Human approval status: ${report.human_approval_status}`);
   if (report.failure_reason) console.log(`STATUS DETAIL: ${report.failure_reason}`);
   console.log('Human approval: required. No commit, merge, push, deployment, or original-tree source write was performed.');
   console.log(`Orchestration report: ${path}`);
@@ -265,7 +274,7 @@ async function main() {
         console.log('No commit, push, merge, or deployment was performed. Review the working-tree diff before committing.');
       }
     } else {
-      const result = await runOrchestration({
+      const sharedOptions = {
         project,
         request: task!,
         apply: args.includes('--apply'),
@@ -276,7 +285,10 @@ async function main() {
         maxRetries: optionalInteger('--max-retries'),
         maxCloudCalls: optionalInteger('--max-cloud-calls'),
         keepWorktree: args.includes('--keep-worktree'),
-      });
+      };
+      const result = args.includes('--multi-task')
+        ? await runMultiTaskOrchestration({ ...sharedOptions, maxTasks: optionalInteger('--max-tasks') })
+        : await runOrchestration(sharedOptions);
       printOrchestrationReport(result.report, result.reportPath);
       const successfulDryRun = result.report.dry_run && result.report.state === 'awaiting_human_review';
       const successfulRun = result.report.validation.automated_checks === 'passed' &&
