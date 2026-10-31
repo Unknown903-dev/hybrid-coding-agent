@@ -1,6 +1,6 @@
 import { readFile, realpath, mkdir, writeFile, lstat } from 'node:fs/promises';
 import { basename, isAbsolute, relative, resolve, sep, join, win32 } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { formatSchemaIssues, proposalSchema } from './proposal-schema.js';
 
 const MAX_FILE_BYTES = 40_000;
@@ -76,7 +76,8 @@ Rules:
   await mkdir(proposalDir, { recursive: true });
   const outputFile = join(proposalDir, `${Date.now()}-${randomUUID()}.json`);
   await writeFile(outputFile, JSON.stringify({ task: options.task, file: rel, model: options.model, summary: p.summary,
-    proposed_content: p.proposed_content, checks: p.checks, risks: p.risks }, null, 2), { flag: 'wx', mode: 0o600 });
+    proposed_content: p.proposed_content, checks: p.checks, risks: p.risks,
+    original_sha256: createHash('sha256').update(content).digest('hex') }, null, 2), { flag: 'wx', mode: 0o600 });
   console.log(`Proposal for ${basename(rel)}: ${p.summary}`);
   console.log(`Saved proposal to ${outputFile}`);
   console.log('No source files were modified. Review this proposal before implementing it.');

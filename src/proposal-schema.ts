@@ -10,6 +10,7 @@ export const proposalSchema = z.object({
   proposed_content: z.string(),
   checks: z.array(nonEmptyString),
   risks: z.array(nonEmptyString),
+  original_sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
 }).strict();
 
 export type Proposal = z.infer<typeof proposalSchema>;

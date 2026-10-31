@@ -1,12 +1,13 @@
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep, win32 } from 'node:path';
 import { createTwoFilesPatch, diffLines } from 'diff';
+import { createHash } from 'node:crypto';
 import { formatSchemaIssues, proposalSchema, type Proposal } from './proposal-schema.js';
 
 const MAX_PROPOSAL_BYTES = 1_000_000;
 const MAX_SOURCE_BYTES = 200_000;
 const PROTECTED_SEGMENTS = new Set([
-  '.git', '.agent-proposals', '.aws', '.codex', '.ssh', 'node_modules',
+  '.git', '.agent-proposals', '.agent-runs', '.agent-worktrees', '.aws', '.codex', '.ssh', 'node_modules',
   'dist', 'build', 'coverage',
 ]);
 const PROTECTED_FILES = new Set(['.env', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
@@ -35,6 +36,7 @@ export interface ValidationReport {
   proposalPath: string;
   projectRoot: string;
   targetPath?: string;
+  originalSha256?: string;
   proposal?: Proposal;
   diff?: DiffAnalysis;
   requiresManualReview: boolean;
@@ -144,7 +146,7 @@ async function safeProposalPath(projectRoot: string, inputPath: string): Promise
   return actual;
 }
 
-async function safeTargetPath(
+export async function resolveSafeTargetPath(
   projectRoot: string,
   file: string,
   extraProtectedPaths: string[],
@@ -236,7 +238,7 @@ export async function validateProposal(options: ValidationOptions): Promise<Vali
 
   let target: { path: string; relativePath: string };
   try {
-    target = await safeTargetPath(projectRoot, proposal.file, options.protectedPaths ?? []);
+    target = await resolveSafeTargetPath(projectRoot, proposal.file, options.protectedPaths ?? []);
   } catch (error) {
     errors.push(error instanceof Error ? error.message : String(error));
     return {
@@ -270,6 +272,7 @@ export async function validateProposal(options: ValidationOptions): Promise<Vali
     proposalPath,
     projectRoot,
     targetPath: target.path,
+    originalSha256: createHash('sha256').update(original).digest('hex'),
     proposal,
     diff,
     requiresManualReview: errors.length === 0 && (diff?.suspicious ?? false),
