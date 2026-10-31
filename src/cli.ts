@@ -128,9 +128,13 @@ function printOrchestrationReport(report: OrchestrationReport, path: string): vo
   console.log(`Orchestration state: ${report.state}`);
   console.log(`Run ID: ${report.run_id}`);
   if (report.selected_task) console.log(`Selected task: ${report.selected_task.task_id} (${report.selected_task.file_scope.join(', ')})`);
-  for (const selected of report.selected_tasks ?? []) console.log(`Selected task: ${selected.task_id} (${selected.file_scope.join(', ')})`);
+  for (const selected of report.selected_tasks ?? []) {
+    console.log(`Selected task: ${selected.task_id} (${selected.file_scope.join(', ')}), dependencies: ${selected.dependencies.join(', ') || 'none'}`);
+  }
+  if (report.execution_order) console.log(`Execution order: ${report.execution_order.join(' -> ')}`);
   for (const result of report.task_results ?? []) {
     console.log(`TASK ${result.order} ${result.task_id}: ${result.status}, proposal ${result.proposal_validation}, checks ${result.automated_checks}, repairs ${result.repair_attempts}`);
+    if (result.blocked_reason) console.log(`  Blocked: ${result.blocked_reason}`);
   }
   console.log(`Plan validation: ${report.validation.plan}`);
   console.log(`Proposal validation: ${report.validation.proposal}`);
@@ -152,7 +156,9 @@ function printRunInspection(inspection: RunInspection): void {
   console.log(`Changed files: ${inspection.changedFiles.join(', ')}`);
   if (inspection.selectedTasks.length > 0) {
     console.log('Selected tasks:');
-    for (const task of inspection.selectedTasks) console.log(`  ${task.taskId}: ${task.file}`);
+    for (const task of inspection.selectedTasks) {
+      console.log(`  ${task.taskId}: ${task.file}; dependencies=${task.dependencies.join(', ') || 'none'}`);
+    }
   }
   if (inspection.executionOrder.length > 0) console.log(`Execution order: ${inspection.executionOrder.join(' -> ')}`);
   if (inspection.taskOutcomes.length > 0) {
