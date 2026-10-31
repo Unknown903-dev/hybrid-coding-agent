@@ -49,7 +49,7 @@ async function discoverDeniedPaths(projectRoot: string): Promise<string[]> {
       const path = join(current, entry.name);
       const secret = entry.name.startsWith('.env') || [
         '.git', '.aws', '.ssh', '.codex', '.agent-proposals', '.agent-runs',
-        '.agent-worktrees', 'node_modules', 'dist', 'build', 'coverage',
+        '.agent-worktrees', '.agent-state', 'node_modules', 'dist', 'build', 'coverage',
       ].includes(entry.name) || entry.isSymbolicLink() || /\.(?:pem|key|p12|pfx)$/i.test(entry.name);
       if (secret) denied.push(path);
       else if (entry.isDirectory()) queue.push(path);

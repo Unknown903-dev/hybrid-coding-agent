@@ -8,7 +8,7 @@ const HIGH_RISK_TAGS = new Set([
   'deployment', 'infrastructure', 'data_loss', 'public_api',
 ]);
 const HIGH_RISK_PATTERN = /\b(security|auth(?:entication|orization)?|billing|payment|migration|deploy(?:ment)?|infrastructure|credential|secret|permission|production)\b/i;
-const PROTECTED_SEGMENTS = new Set(['.git', '.agent-runs', '.agent-proposals', '.agent-worktrees', '.env', 'node_modules', '.aws', '.ssh', '.codex']);
+const PROTECTED_SEGMENTS = new Set(['.git', '.agent-runs', '.agent-proposals', '.agent-worktrees', '.agent-state', '.env', 'node_modules', '.aws', '.ssh', '.codex']);
 const PROTECTED_FILES = new Set([
   '.env', '.netrc', '.npmrc', '.pypirc', 'credentials.json', 'secrets.json', 'service-account.json',
   'package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', '.agent-validation.json',
