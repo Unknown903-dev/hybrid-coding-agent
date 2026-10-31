@@ -1,7 +1,7 @@
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { z } from 'zod';
-import { resolveSafeTargetPath } from '../proposal-validation.js';
+import { resolveSafeCreationPath, resolveSafeTargetPath } from '../proposal-validation.js';
 
 const MAX_PLAN_BYTES = 1_000_000;
 const MAX_REPORT_BYTES = 1_000_000;
@@ -13,7 +13,9 @@ export const localRunReportSchema = z.object({
   task: z.string().max(10_000).optional(),
   model: z.string().max(500).optional(),
   proposed_file: z.string().trim().min(1).max(1_000).optional(),
+  operation: z.enum(['modify', 'create']).optional(),
   proposed_files: z.array(z.string().trim().min(1).max(1_000)).min(2).max(5).optional(),
+  proposed_operations: z.record(z.string().trim().min(1).max(1_000), z.enum(['modify', 'create'])).optional(),
   proposal_summary: z.string().max(10_000).optional(),
   structural_validation: z.unknown().optional(),
   application: z.unknown().optional(),
@@ -73,14 +75,21 @@ export async function readRunArtifact(projectRoot: string, input: string): Promi
   const parsed = localRunReportSchema.safeParse(value);
   if (!parsed.success) throw new Error(`Invalid run report: ${parsed.error.issues.map(issue => `${issue.path.join('.')}: ${issue.message}`).join('; ')}`);
   const proposedFiles = parsed.data.proposed_files ?? (parsed.data.proposed_file ? [parsed.data.proposed_file] : []);
-  for (const file of proposedFiles) await resolveSafeTargetPath(projectRoot, file, ['package.json', '.agent-validation.json']);
+  const effectiveOperations = parsed.data.proposed_operations ?? Object.fromEntries(proposedFiles.map(file => [file,
+    parsed.data.proposed_file === file && parsed.data.operation === 'create' ? 'create' : 'modify',
+  ])) as Record<string, 'modify' | 'create'>;
+  for (const file of proposedFiles) {
+    const operation = effectiveOperations[file] ?? 'modify';
+    if (operation === 'create') await resolveSafeCreationPath(projectRoot, file, ['package.json', '.agent-validation.json']);
+    else await resolveSafeTargetPath(projectRoot, file, ['package.json', '.agent-validation.json']);
+  }
   const patchPath = await safeArtifact(projectRoot, `.agent-runs/${parsed.data.task_id}.patch`, MAX_PATCH_BYTES, '.patch');
   const patch = await readFile(patchPath, 'utf8');
-  validatePatchScope(patch, proposedFiles);
+  validatePatchScope(patch, proposedFiles, effectiveOperations);
   return { report: parsed.data, patch };
 }
 
-function validatePatchScope(patch: string, expectedFiles: string[]): void {
+function validatePatchScope(patch: string, expectedFiles: string[], operations: Record<string, 'modify' | 'create'>): void {
   const normalizedExpected = expectedFiles.map(expectedFile => {
     if (isAbsolute(expectedFile) || expectedFile.split(/[\\/]/).includes('..')) throw new Error('Run report contains an unsafe proposed file path.');
     const normalized = expectedFile.replaceAll('\\', '/');
@@ -101,6 +110,17 @@ function validatePatchScope(patch: string, expectedFiles: string[]): void {
       throw new Error('Patch contains changes outside the report authorized file.');
     }
     actual.add(header[1]!);
+    const operation = operations[header[1]!] ?? 'modify';
+    const start = header.index!;
+    const next = headers.find(candidate => candidate.index! > start)?.index ?? patch.length;
+    const chunk = patch.slice(start, next);
+    if (operation === 'create') {
+      if (!/^new file mode 100644$/m.test(chunk) || !/^--- \/dev\/null$/m.test(chunk) || !new RegExp(`^\\+\\+\\+ b/${header[1]!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm').test(chunk)) {
+        throw new Error('Created-file patch is malformed or has an unsafe mode.');
+      }
+    } else if (/^new file mode |^--- \/dev\/null$/m.test(chunk)) {
+      throw new Error('Patch operation differs from the authorized modify operation.');
+    }
   }
   if (actual.size !== normalizedExpected.length) throw new Error('Patch does not contain every authorized file exactly once.');
 }
@@ -119,7 +139,9 @@ export function summarizedRunReport(report: LocalRunReport): string {
     status: report.status,
     task: report.task,
     proposed_file: report.proposed_file,
+    operation: report.operation,
     proposed_files: report.proposed_files,
+    proposed_operations: report.proposed_operations,
     proposal_summary: report.proposal_summary,
     structural_validation: report.structural_validation,
     application: report.application,
