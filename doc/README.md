@@ -1,4 +1,4 @@
-# Hybrid Coding Agent — Milestone 4
+# Hybrid Coding Agent — Milestone 5
 
 Starter integrating a **cloud Codex supervisor (read-only planning)** and a **local Ollama worker through Codex CLI**. This is not yet an automatic multi-agent orchestrator. It deliberately requires explicit steps and protects writes by default.
 
@@ -18,8 +18,9 @@ npm run typecheck
 ## Run (substitute your actual repo path)
 
 ```bash
-# Cloud supervisor: creates a plan, does not edit files
-npm run dev -- plan --project /absolute/path/to/demo-repo --task "Add a utility to format durations"
+# Cloud supervisor: explicit cloud authorization, read-only structured plan
+npm run dev -- supervisor plan --project /absolute/path/to/demo-repo \
+  --task "Add a utility to format durations" --allow-cloud
 
 # Local worker: read-only analysis, no cloud-model usage
 npm run dev -- local --project /absolute/path/to/demo-repo --task "Explain where to add duration formatting"
@@ -32,8 +33,8 @@ Review changes with `git diff` and run your tests yourself. Codex tool approvals
 
 ## Next milestones
 
-1. Cloud supervisor escalation and review checkpoints.
-2. Automated task scheduling and model usage budgets.
+1. Human-approved delegation from supervisor plans.
+2. Automated task scheduling and model usage policies.
 
 ## Security
 
@@ -170,6 +171,86 @@ The final worktree diff is saved as `.agent-runs/<task-id>.patch` before cleanup
 
 Diagnostics forwarded to Ollama are restricted to the authorized file, failed check names and exit codes, bounded stdout/stderr, modified-file names, and diff counts. Common credential/token patterns are redacted. This is a best-effort leak-reduction measure, not a substitute for keeping secrets out of source and test output.
 
+## Cloud Codex supervisor
+
+The supervisor is a read-only planning and review layer built with the official `@openai/codex-sdk`. It uses the user's existing Codex sign-in and configuration; it does not require or save a separate OpenAI API key and does not modify global Codex configuration. SDK calls start threads with:
+
+- `sandboxMode: "read-only"`;
+- `approvalPolicy: "never"`;
+- agent network access and web search disabled;
+- per-request deny rules for repository `.env*`, credential files, and agent-artifact directories;
+- a restricted child-process environment.
+
+The default Codex model is intentionally omitted so the user's available configured default is used. An optional `--cloud-model` is passed through exactly as requested. If that model is unavailable or unauthorized, the request fails and is recorded; the orchestrator never silently upgrades, substitutes, or retries with a more expensive model.
+
+Cloud supervisor operations never call `execute`, `repair`, Ollama, deployment tools, Git commit, merge, or push. They may write only sanitized plans, reviews, and usage records under `.agent-runs/`.
+
+### Structured planning
+
+```sh
+npm run dev -- supervisor plan \
+  --project /path/to/repository \
+  --task "Add employee labor-hour charts" \
+  --allow-cloud \
+  --max-tasks 8 \
+  --max-cloud-calls 2
+```
+
+Before any planning request, the orchestrator obtains tracked and non-ignored untracked paths with `git ls-files`, then verifies every candidate with `lstat` and `realpath`. Symlinks, escaping paths, protected/secret paths, oversized files, and non-regular files are excluded. The resulting inventory and bounded, redacted source excerpts are included as untrusted planning context. File count, path characters, per-file content, total content, and individual file size all have hard limits; large repositories therefore produce a deliberately truncated inventory.
+
+The cloud response must match a strict versioned Zod schema. Tasks include IDs, ordered dependencies, operation type, explicit relative file scope, acceptance criteria, risk, complexity, proposed executor, routing explanation, and validation requirements. Unknown or circular dependencies and out-of-order plans are rejected. Plans also record whether repository context was sufficient. When the relevant file is not in the selectable inventory, the supervisor must return `context_status: "insufficient"` with no implementation tasks instead of inventing a path.
+
+Cloud routing recommendations are advisory. A deterministic policy overrides them when necessary:
+
+- only simple low-risk, one-existing-file modifications are directly local-eligible;
+- bounded moderate work needs one file, at least two acceptance criteria, and explicit validation;
+- complex, multi-file, create/delete, protected-path, or missing-file tasks route to cloud/human handling;
+- security, authentication, authorization, billing, migration, deployment, infrastructure, public-API, production, credential, and data-loss work routes to cloud/human handling.
+
+For `modify_existing` and `delete`, every model-selected path must exactly match a path in the verified inventory. Absolute paths, traversal, protected paths, symlink escapes, and nonexistent or inventory-truncated paths are rejected; the orchestrator never rewrites a bad path to a guessed alternative. Genuine `create` tasks may name a new safe relative path, but deterministic routing marks them ineligible for the current local worker and keeps them for cloud/human handling only.
+
+The current local worker still supports exactly one existing safe regular file per task.
+
+The legacy `plan` command remains as an alias for structured supervisor planning, but now requires the same `--allow-cloud` authorization.
+
+### Inspect a saved plan without cloud usage
+
+```sh
+npm run dev -- supervisor inspect \
+  --project /path/to/repository \
+  --plan .agent-runs/<plan-id>-supervisor-plan.json
+```
+
+`inspect` rebuilds the bounded repository inventory and performs schema, dependency, grounded file-scope, and deterministic routing checks locally. It never contacts Codex and does not require `--allow-cloud`. Plan paths must resolve to regular non-symlink JSON files inside the repository's `.agent-runs/` directory. A repository change or a different bounded inventory can therefore invalidate a previously saved existing-file plan.
+
+### Review a local run
+
+```sh
+npm run dev -- supervisor review \
+  --project /path/to/repository \
+  --report .agent-runs/<task-id>-repair.json \
+  --allow-cloud
+```
+
+Review requires a bounded local report and the matching `.agent-runs/<task-id>.patch`. The patch is checked against the report's authorized file before forwarding. Only a sanitized report summary and bounded/redacted patch are sent; paths embedded in reports are not trusted. Missing, malformed, oversized, symlinked, escaping, or multi-file artifacts are rejected before a cloud call.
+
+Review output separates structural validity, trusted-check results, semantic relevance, security findings, remaining risk, and required human approval. Verdicts are:
+
+- `ready_for_human_review`;
+- `retry_local`;
+- `cloud_escalation_recommended`;
+- `rejected`.
+
+Deterministic policy prevents a failed or structurally invalid local run from being marked ready merely because the model recommends it. Reviews never apply patches.
+
+### Cloud authorization and usage
+
+Cloud calls require either the explicit `--allow-cloud` flag or `SUPERVISOR_CLOUD_ENABLED=YES`. Local `supervisor inspect` needs neither. The default call budget is two per usage manager and can be lowered with `--max-cloud-calls`; exhausted or disabled budgets stop before invoking the adapter.
+
+Usage records are stored as uniquely named `.agent-runs/<task-id>-<run-id>-supervisor-usage.json` files and include operation, timestamp, success/failure, requested or reported model when known, and token counts returned by the SDK when available. Missing usage stays unknown. The project does not estimate dollar cost, subscription quota, or remaining plan capacity.
+
+Cloud-hosted inference may consume OpenAI-hosted usage and requires Codex authentication. Ollama proposal/repair inference stays on the configured local Ollama endpoint and does not consume a supervisor call budget. Redaction is best effort and cannot guarantee removal of every secret; keep credentials out of repositories, patches, and logs.
+
 ## Current limitations
 
 - Validation establishes structure and filesystem safety, not intent or semantic correctness.
@@ -179,7 +260,9 @@ Diagnostics forwarded to Ollama are restricted to the authorized file, failed ch
 - Execution supports one existing file and trusted checks; it does not merge accepted changes back into the original tree.
 - Each proposal targets one existing regular file; file creation, deletion, and multi-file proposals are not supported.
 - A process crash may leave an owned worktree or lock for manual inspection; the executor never prunes unknown worktrees or guesses that another process is dead.
-- Repair uses the local Ollama endpoint only. It does not implement cloud supervision, autonomous scheduling, automatic merging, or deployment.
+- Supervisor planning and review are explicit, read-only calls. They do not implement automatic delegation, cloud takeover, merging, or deployment.
+- The bounded inventory is intentionally incomplete in very large repositories. If the needed file is omitted, planning reports insufficient context rather than searching outside the allowed context or guessing a path.
+- Source redaction is best effort. The inventory excludes conventional secret locations and credential file types, but repositories should not contain secrets under misleading ordinary source-file names.
 
 Run project checks with:
 
