@@ -1,6 +1,6 @@
-# Hybrid Coding Agent — Milestone 5
+# Hybrid Coding Agent — Milestone 6B
 
-Starter integrating a **cloud Codex supervisor (read-only planning)** and a **local Ollama worker through Codex CLI**. This is not yet an automatic multi-agent orchestrator. It deliberately requires explicit steps and protects writes by default.
+This project connects a **read-only Cloud Codex supervisor**, a direct **local Ollama proposal/repair worker**, and a **TypeScript policy and execution orchestrator**. Milestone 6A provides one explicitly authorized end-to-end command for a single eligible existing-file task; Milestone 6B adds explicit human approval and controlled application of the exact reviewed patch. It does not schedule multiple tasks, commit, push, merge, deploy, or perform cloud coding.
 
 ## Prerequisites
 
@@ -31,10 +31,100 @@ CONFIRM_LOCAL_EDITS=YES npm run dev -- local --project /absolute/path/to/demo-re
 
 Review changes with `git diff` and run your tests yourself. Codex tool approvals, file sandboxing, and model capabilities depend on your CLI/version/OS.
 
+## End-to-end orchestration
+
+```sh
+npm run dev -- run \
+  --project /absolute/path/to/disposable-repository \
+  --task "Fix the calculator addition bug" \
+  --allow-cloud \
+  --apply
+```
+
+The `run` command performs one bounded lifecycle:
+
+1. Verifies the Git repository has a `HEAD` commit and no tracked index or working-tree changes.
+2. Uses the shared Cloud Codex call budget to obtain and validate a grounded plan.
+3. Requires exactly one deterministically local-eligible task targeting one existing file tracked at `HEAD`.
+4. Sends a bounded task and that authorized file to Ollama's direct HTTP API.
+5. Validates the strict proposal schema, target path, and SHA-256 source digest.
+6. Applies the proposal in one owned detached worktree, runs trusted checks, and requests bounded local repair only after a failed check.
+7. Saves the final patch and repair report before worktree cleanup.
+8. Uses the same cloud budget for a read-only supervisor review, then stops for human review.
+
+Available flags are:
+
+- `--model <name>`: local Ollama proposal and repair model; defaults to `LOCAL_MODEL` or `qwen2.5-coder:7b`.
+- `--cloud-model <name>`: exact requested Codex supervisor model; no silent substitution.
+- `--max-retries <0-5>`: local repair attempts after the initial proposal.
+- `--max-cloud-calls <0-20>`: total planning plus review calls; the default is two.
+- `--keep-worktree`: preserve the owned execution worktree for inspection.
+- `--dry-run`: perform grounded planning and task selection without contacting Ollama, creating a worktree, running checks, or requesting final cloud review.
+
+Normal execution requires both `--allow-cloud` and `--apply`. A non-dry run without either authorization stops before any model call. There is no fallback to cloud coding when local generation, execution, or repair fails.
+
+### Orchestration reports and recovery
+
+Each run atomically maintains `.agent-runs/<run-id>-orchestration.json`. Its versioned schema records lifecycle transitions, plan/task/proposal/report/patch/review references, requested models, shared cloud-call counts, SDK token usage when reported, validation outcomes, review status, failure details, and the permanent human-approval requirement. Unknown token usage is stored as `null`, not fabricated as zero.
+
+Successful automated checks produce a reviewable patch, not an approved or merged change. If final cloud review fails or the remaining call budget is exhausted, the patch is retained and the state remains `awaiting_cloud_review`. Unsupported plans become `blocked`; unsafe proposals, stale digests, missing `HEAD`, dirty tracked state, execution failures without reviewable artifacts, and other terminal errors become `failed`. Repair failures retain diagnostics and a patch when one can be safely generated.
+
+State and artifacts can be inspected with normal JSON and diff tools:
+
+```sh
+cat .agent-runs/<run-id>-orchestration.json
+git apply --stat .agent-runs/<execution-task-id>.patch
+```
+
+### Inspect, approve, and integrate a patch
+
+Inspection is read-only and prints the original request, authorized file, diff counts, complete patch, validation outcome, Cloud review, warnings, usage, patch SHA-256, and approval eligibility:
+
+```sh
+npm run dev -- run inspect --project /path/to/repository --run-id <run-id>
+```
+
+Approval requires either typing `approve` at an interactive terminal or passing the explicit `--yes` flag:
+
+```sh
+npm run dev -- run approve --project /path/to/repository --run-id <run-id> --yes
+```
+
+Approval requires passing trusted checks and a `ready_for_human_review` review artifact. It revalidates the run, execution report, review, protected path, original source digest, and patch applicability. It records the exact patch hash, repository identity, `HEAD`, source digest, artifact hashes, timestamp, and authorization method under `.agent-state/approvals/`. Approval does not modify source and remains a human decision—not proof of correctness.
+
+Apply that exact approved patch to the original working tree with:
+
+```sh
+npm run dev -- run integrate --project /path/to/repository --run-id <run-id>
+```
+
+Integration verifies the signed approval, artifact hashes, patch hash, repository identity, unchanged `HEAD`, clean tracked working tree/index, unchanged target digest, protected-path policy, exact one-file scope, and `git apply --check`. It acquires the same per-target lock as worktree execution, applies without shell interpolation, then requires the resulting working-tree diff to exactly equal the approved patch. It creates no commit and performs no merge, push, or deployment.
+
+The original authorized file is buffered before application. If application or post-application verification fails, the coordinator restores that file and records a failed integration audit. Successful and failed audit records are separately HMAC-signed under `.agent-state/integrations/`; a successful run cannot be integrated twice.
+
+#### Local integrity threat model
+
+The signing key is a random, mode-`0600` local key under `.agent-state/`. Approval and audit records are HMAC-bound to it, while `.agent-state` and its subdirectories are rejected if they are symlinks and are excluded from supervisor/local-worker file scope. This prevents approval by merely editing a JSON report or patch and detects post-approval artifact changes.
+
+This is a local single-user integrity mechanism, not a defense against the repository owner, root, malware, filesystem rollback, or an attacker with the same OS account and access to the signing key. Deleting the key invalidates existing approvals; deleting signed audits can erase local history. For stronger assurance, protect the repository and key with OS access controls or an external signing/audit system.
+
+### Disposable-repository test
+
+Create a disposable Git repository with an initial commit, one existing source file, and trusted validation configuration. Ensure Ollama is running locally and Codex is signed in, then run the command above. Confirm the original file and `HEAD` are unchanged, inspect the saved patch/report, and manually remove any intentionally preserved worktree. Tests and compilers execute repository code: use a container or VM for repositories you do not trust.
+
+## Architecture and security boundaries
+
+- Cloud Codex performs read-only structured planning and review through the SDK with explicit authorization.
+- Ollama receives one authorized source file and returns untrusted structured proposal or repair content. Ollama calls do not count against the cloud budget.
+- The TypeScript orchestrator owns path authorization, deterministic routing, source digests, trusted commands, retries, locks, worktrees, reports, and approvals.
+- Repository files, LLM output, check logs, patches, and saved reports are all treated as untrusted data.
+- Model output cannot choose commands, add permissions, expand file scope, or trigger a deployment or Git integration action.
+- Git worktrees isolate source-control state but are not an OS sandbox. Trusted checks may execute repository code with the current user's OS permissions.
+
 ## Next milestones
 
-1. Human-approved delegation from supervisor plans.
-2. Automated task scheduling and model usage policies.
+1. Multi-task scheduling and dependency coordination.
+2. Separately authorized commit, merge, or remote integration workflows.
 
 ## Security
 
@@ -260,9 +350,14 @@ Cloud-hosted inference may consume OpenAI-hosted usage and requires Codex authen
 - Execution supports one existing file and trusted checks; it does not merge accepted changes back into the original tree.
 - Each proposal targets one existing regular file; file creation, deletion, and multi-file proposals are not supported.
 - A process crash may leave an owned worktree or lock for manual inspection; the executor never prunes unknown worktrees or guesses that another process is dead.
-- Supervisor planning and review are explicit, read-only calls. They do not implement automatic delegation, cloud takeover, merging, or deployment.
+- Supervisor planning and review remain read-only. The explicitly authorized `run` workflow coordinates one local task but never performs cloud takeover, merging, or deployment.
 - The bounded inventory is intentionally incomplete in very large repositories. If the needed file is omitted, planning reports insufficient context rather than searching outside the allowed context or guessing a path.
 - Source redaction is best effort. The inventory excludes conventional secret locations and credential file types, but repositories should not contain secrets under misleading ordinary source-file names.
+- End-to-end orchestration supports exactly one dependency-free existing-file task. Multi-task plans and create/delete work are saved and blocked rather than partially executed.
+- A Cloud review verdict is advisory. It never starts another repair loop, cloud coding task, merge, commit, push, or deployment.
+- Approval/integration currently supports the same single existing text file as Milestone 6A; binary, mode-changing, rename, creation, and deletion patches are rejected.
+- Integration intentionally leaves the approved change unstaged in the original working tree for manual review and commit.
+- Git patch application plus in-process restoration prevents partial-file results during handled failures. An uncatchable process termination or machine failure can still leave the complete approved working-tree diff without a final audit; inspect `git diff` and the local audit directory before retrying.
 
 Run project checks with:
 
