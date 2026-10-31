@@ -40,6 +40,7 @@ credentials.json
 .agent-cache/
 .agent-temp/
 .agent-tmp/
+.agent-state/
 
 # Local agent state
 .agent-state/
