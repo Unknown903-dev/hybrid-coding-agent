@@ -1,8 +1,8 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, realpath, rename, rm, writeFile, type FileHandle } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, rename, rm, writeFile, type FileHandle } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
-import { proposalSchema } from './proposal-schema.js';
+import { modelProposalFieldsSchema } from './proposal-schema.js';
 import {
   EXECUTION_PROTECTED_PATHS,
   acquireExecutionLock,
@@ -10,6 +10,7 @@ import {
 } from './proposal-execution.js';
 import {
   generateDiff,
+  resolveSafeCreationPath,
   resolveSafeTargetPath,
   validateProposal,
   type DiffAnalysis,
@@ -29,9 +30,7 @@ const MAX_DIAGNOSTIC_CHARS = 12_000;
 const MAX_SOURCE_CONTEXT_CHARS = 40_000;
 const MAX_MODEL_RESPONSE_CHARS = 50_000;
 
-const repairResponseSchema = proposalSchema
-  .pick({ summary: true, proposed_content: true, checks: true, risks: true })
-  .strict();
+const repairResponseSchema = modelProposalFieldsSchema;
 
 export interface RepairRequest {
   task: string;
@@ -128,6 +127,7 @@ export interface RepairReport {
   task?: string;
   model?: string;
   proposed_file?: string;
+  operation?: 'modify' | 'create';
   proposal_path: string;
   max_repair_attempts: number;
   repair_attempts_used: number;
@@ -291,9 +291,11 @@ async function writeJsonArtifact(projectRoot: string, taskId: string, report: Re
   return path;
 }
 
-async function savePatch(projectRoot: string, worktree: string, taskId: string, file: string): Promise<string | undefined> {
-  const result = await runProcess('git', ['diff', '--no-ext-diff', '--binary', '--', file], worktree, 2_000_000);
-  if (result.code !== 0) throw new Error(`Unable to generate final repair patch: ${result.error ?? result.stderr}`);
+async function savePatch(projectRoot: string, worktree: string, taskId: string, file: string, operation: 'modify' | 'create'): Promise<string | undefined> {
+  const result = operation === 'create'
+    ? await runProcess('git', ['diff', '--no-index', '--binary', '--', '/dev/null', file], worktree, 2_000_000)
+    : await runProcess('git', ['diff', '--no-ext-diff', '--binary', '--', file], worktree, 2_000_000);
+  if (result.code !== 0 && !(operation === 'create' && result.code === 1)) throw new Error(`Unable to generate final repair patch: ${result.error ?? result.stderr}`);
   if (!result.stdout) return undefined;
   const path = resolve(projectRoot, '.agent-runs', `${taskId}.patch`);
   await mkdir(resolve(projectRoot, '.agent-runs'), { recursive: true, mode: 0o700 });
@@ -376,6 +378,7 @@ export async function coordinateRepair(options: RepairCoordinatorOptions): Promi
   let lock: { handle: FileHandle; path: string } | undefined;
   let worktreeCreated = false;
   let authorizedFile = '';
+  let authorizedOperation: 'modify' | 'create' = 'modify';
 
   const remainingTime = (): number => totalBudget - (Date.now() - started);
   const fail = (reason: RepairStopReason, message: string): never => {
@@ -403,8 +406,10 @@ export async function coordinateRepair(options: RepairCoordinatorOptions): Promi
     report.task = initialProposal.task;
     report.model = initialProposal.model;
     report.proposed_file = initialProposal.file;
+    report.operation = initialProposal.operation;
     authorizedFile = initialProposal.file;
-    if (!initialProposal.original_sha256 || validation.originalSha256 !== initialProposal.original_sha256) {
+    authorizedOperation = initialProposal.operation;
+    if (initialProposal.operation === 'modify' && (!initialProposal.original_sha256 || validation.originalSha256 !== initialProposal.original_sha256)) {
       fail('stale_proposal', 'Initial proposal is stale or lacks the required original_sha256.');
     }
 
@@ -429,14 +434,17 @@ export async function coordinateRepair(options: RepairCoordinatorOptions): Promi
     report.worktree.location = worktreePath;
 
     validation = await validateProposal({ project: validationRoot, proposalPath: options.proposalPath, protectedPaths: EXECUTION_PROTECTED_PATHS });
-    if (!validation.valid || !validation.proposal || !validation.diff || !validation.proposal.original_sha256 || validation.originalSha256 !== validation.proposal.original_sha256) {
+    if (!validation.valid || !validation.proposal || !validation.diff ||
+        (validation.proposal.operation === 'modify' && (!validation.proposal.original_sha256 || validation.originalSha256 !== validation.proposal.original_sha256))) {
       fail('stale_proposal', 'Initial proposal became stale before worktree application.');
     }
     const revalidatedProposal = validation.proposal!;
     const revalidatedDiff = validation.diff!;
-    const target = await resolveSafeTargetPath(worktreePath, authorizedFile, EXECUTION_PROTECTED_PATHS);
-    const original = await readFile(target.path, 'utf8');
-    if (hash(original) !== revalidatedProposal.original_sha256) fail('worktree_base_mismatch', 'Proposal source does not match the worktree HEAD.');
+    const target = authorizedOperation === 'create'
+      ? await resolveSafeCreationPath(worktreePath, authorizedFile, EXECUTION_PROTECTED_PATHS)
+      : await resolveSafeTargetPath(worktreePath, authorizedFile, EXECUTION_PROTECTED_PATHS);
+    const original = authorizedOperation === 'create' ? '' : await readFile(target.path, 'utf8');
+    if (authorizedOperation === 'modify' && hash(original) !== revalidatedProposal.original_sha256) fail('worktree_base_mismatch', 'Proposal source does not match the worktree HEAD.');
 
     const proposalHashes = new Set<string>();
     let expectedCurrentHash = hash(original);
@@ -447,18 +455,28 @@ export async function coordinateRepair(options: RepairCoordinatorOptions): Promi
     let previousFingerprint: string | undefined;
     let previousNormalizedContent: string | undefined;
     let pendingModelResponse: string | undefined;
+    let creationApplied = false;
     const adapter = options.adapter ?? new OllamaRepairAdapter();
 
     while (true) {
       if (remainingTime() <= 0) fail('time_budget_exceeded', 'Repair exceeded its total time budget.');
       const attemptStarted = Date.now();
-      const currentOnDisk = await readFile(target.path, 'utf8');
-      if (hash(currentOnDisk) !== expectedCurrentHash) fail('unexpected_source_change', 'Authorized source changed unexpectedly before proposal application.');
+      if (!creationApplied && authorizedOperation === 'create') {
+        if (await lstat(target.path).then(() => true, () => false)) fail('unexpected_source_change', 'Creation destination appeared before proposal application.');
+      } else {
+        const currentOnDisk = await readFile(target.path, 'utf8');
+        if (hash(currentOnDisk) !== expectedCurrentHash) fail('unexpected_source_change', 'Authorized source changed unexpectedly before proposal application.');
+      }
 
       const proposalHash = hash(currentProposal.proposed_content);
       if (proposalHashes.has(proposalHash)) fail('identical_proposal', 'The local worker repeated an identical proposal.');
       proposalHashes.add(proposalHash);
-      await writeFile(target.path, currentProposal.proposed_content, 'utf8');
+      if (!creationApplied && authorizedOperation === 'create') {
+        await writeFile(target.path, currentProposal.proposed_content, { flag: 'wx', mode: 0o644, encoding: 'utf8' });
+        creationApplied = true;
+      } else {
+        await writeFile(target.path, currentProposal.proposed_content, 'utf8');
+      }
       expectedCurrentHash = proposalHash;
 
       const allowedFiles = new Set([
@@ -599,6 +617,7 @@ export async function coordinateRepair(options: RepairCoordinatorOptions): Promi
       }
 
       const repairProposal = {
+        operation: 'modify' as const,
         task: currentProposal.task,
         file: authorizedFile,
         model: currentProposal.model,
@@ -657,14 +676,14 @@ export async function coordinateRepair(options: RepairCoordinatorOptions): Promi
       expectedCurrentHash = repairValidation.originalSha256!;
     }
 
-    report.final_patch_path = await savePatch(projectRoot, worktreePath, taskId, authorizedFile);
+    report.final_patch_path = await savePatch(projectRoot, worktreePath, taskId, authorizedFile, authorizedOperation);
   } catch (error) {
     if (report.errors.length === 0) report.errors.push(error instanceof Error ? error.message : String(error));
     report.status = 'failed';
     report.cloud_escalation_recommended = true;
     if (worktreeCreated && authorizedFile && !report.final_patch_path) {
       try {
-        report.final_patch_path = await savePatch(projectRoot, worktreePath, taskId, authorizedFile);
+        report.final_patch_path = await savePatch(projectRoot, worktreePath, taskId, authorizedFile, authorizedOperation);
       } catch (patchError) {
         report.errors.push(patchError instanceof Error ? patchError.message : String(patchError));
       }

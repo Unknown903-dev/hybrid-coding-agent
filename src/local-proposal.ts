@@ -1,12 +1,14 @@
 import { readFile, realpath, mkdir, writeFile, lstat } from 'node:fs/promises';
 import { basename, isAbsolute, relative, resolve, sep, join, win32 } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { formatSchemaIssues, proposalSchema } from './proposal-schema.js';
+import { formatSchemaIssues, modelProposalFieldsSchema } from './proposal-schema.js';
+import { resolveSafeCreationPath } from './proposal-validation.js';
 
 const MAX_FILE_BYTES = 40_000;
 const BLOCKED = new Set(['.env', '.git', '.agent-state', 'node_modules', '.ssh', '.aws', '.codex', 'dist', 'build', 'coverage']);
 
 export interface LocalProposalRequest {
+  operation: 'modify' | 'create';
   task: string;
   file: string;
   model: string;
@@ -38,9 +40,10 @@ Rules:
 - Avoid unrelated cleanup, comments, renaming, and formatting changes.
 - proposed_content must contain the COMPLETE file text, never a patch or markdown fence.
 - Never claim a test, typecheck, lint, or command passed: you are not given execution results. State that checks were not run when relevant.
-- If no meaningful improvement is needed, return the original content unchanged and say so in summary; validation will record this as a deliberate no-change result.
+- For modify operations, if no meaningful improvement is needed, return the original content unchanged and say so in summary.
+- For create operations, produce complete initial content for exactly the declared new file; never suggest creating directories or other files.
 - Do not invent other files, commands to execute, tool calls, validation results, or facts about the repository.` },
-          { role: 'user', content: `Task: ${request.task}\nTarget file: ${request.file}\nOriginal file content:\n${request.originalContent}` },
+          { role: 'user', content: `Operation: ${request.operation}\nTask: ${request.task}\nTarget file: ${request.file}\n${request.operation === 'create' ? 'The target is verified absent. Produce its complete initial content.' : `Original file content:\n${request.originalContent}`}` },
         ],
       }),
     });
@@ -76,10 +79,12 @@ export async function proposeLocalChange(options: {
   file: string;
   task: string;
   model: string;
+  operation?: 'modify' | 'create';
   timeoutMs?: number;
   adapter?: LocalProposalAdapter;
 }): Promise<string> {
   const projectRoot = await realpath(options.project);
+  const operation = options.operation ?? 'modify';
   if (isAbsolute(options.file) || win32.isAbsolute(options.file) || options.file.split(/[\\/]/).includes('..')) {
     throw new Error('File must be a repository-relative source path without traversal.');
   }
@@ -88,19 +93,26 @@ export async function proposeLocalChange(options: {
   if (!lexicalRelative || lexicalRelative === '..' || lexicalRelative.startsWith(`..${sep}`)) {
     throw new Error('File must be a safe source file inside the project.');
   }
-  const targetRealPath = await realpath(targetPath);
-  const rel = relative(projectRoot, targetRealPath);
-  if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || resolve(projectRoot, rel) !== targetRealPath || isBlocked(rel)) {
-    throw new Error('File must be a safe source file inside the project (secrets and symlinks outside the project are blocked).');
+  let rel: string;
+  let content: string;
+  if (operation === 'create') {
+    const target = await resolveSafeCreationPath(projectRoot, options.file);
+    rel = target.relativePath;
+    content = '';
+  } else {
+    const targetRealPath = await realpath(targetPath);
+    rel = relative(projectRoot, targetRealPath);
+    if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || resolve(projectRoot, rel) !== targetRealPath || isBlocked(rel)) {
+      throw new Error('File must be a safe source file inside the project (secrets and symlinks outside the project are blocked).');
+    }
+    const stat = await lstat(targetRealPath);
+    if (!stat.isFile() || stat.size > MAX_FILE_BYTES) throw new Error(`Only regular files up to ${MAX_FILE_BYTES} bytes are supported.`);
+    content = await readFile(targetRealPath, 'utf8');
   }
-  const stat = await lstat(targetRealPath);
-  if (!stat.isFile() || stat.size > MAX_FILE_BYTES) {
-    throw new Error(`Only regular files up to ${MAX_FILE_BYTES} bytes are supported.`);
-  }
-  const content = await readFile(targetRealPath, 'utf8');
   if (content.includes('\u0000')) throw new Error('Binary files are not supported.');
 
   const raw = await (options.adapter ?? new OllamaProposalAdapter()).requestProposal({
+    operation,
     task: options.task,
     file: rel,
     model: options.model,
@@ -115,16 +127,19 @@ export async function proposeLocalChange(options: {
       throw new Error(`The model returned malformed proposal JSON: ${error instanceof Error ? error.message : String(error)}. Source files were not modified.`);
     }
   }
-  const parsed = proposalSchema.pick({ summary: true, proposed_content: true, checks: true, risks: true }).strict().safeParse(modelOutput);
+  const parsed = modelProposalFieldsSchema.safeParse(modelOutput);
   if (!parsed.success) {
     throw new Error(`The model did not return the required proposal fields: ${formatSchemaIssues(parsed.error).join('; ')}. Source files were not modified.`);
   }
   const p = parsed.data;
   const proposalDir = await ensureProposalDirectory(projectRoot);
   const outputFile = join(proposalDir, `${Date.now()}-${randomUUID()}.json`);
-  await writeFile(outputFile, JSON.stringify({ task: options.task, file: rel, model: options.model, summary: p.summary,
+  const resultingSha256 = createHash('sha256').update(p.proposed_content).digest('hex');
+  await writeFile(outputFile, JSON.stringify({ operation, task: options.task, file: rel, model: options.model, summary: p.summary,
     proposed_content: p.proposed_content, checks: p.checks, risks: p.risks,
-    original_sha256: createHash('sha256').update(content).digest('hex') }, null, 2), { flag: 'wx', mode: 0o600 });
+    ...(operation === 'modify' ? { original_sha256: createHash('sha256').update(content).digest('hex') } : {
+      expected_absent: true, resulting_sha256: resultingSha256,
+    }) }, null, 2), { flag: 'wx', mode: 0o600 });
   console.log(`Proposal for ${basename(rel)}: ${p.summary}`);
   console.log(`Saved proposal to ${outputFile}`);
   console.log('No source files were modified. Review this proposal before implementing it.');
