@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { acquireExecutionLock, EXECUTION_PROTECTED_PATHS, releaseExecutionLock } from '../proposal-execution.js';
 import { resolveSafeTargetPath, validateProposal } from '../proposal-validation.js';
 import { readRunArtifact, sanitizeCloudText } from '../supervisor/artifacts.js';
+import { orderTasksByDependencies } from '../supervisor/dependency-graph.js';
 import { supervisorReviewSchema, type SupervisorReview } from '../supervisor/schemas.js';
 import { approvalRecordSchema, integrationAuditSchema, type ApprovalRecord, type IntegrationAudit } from './integration-schemas.js';
 import { orchestrationReportSchema, type OrchestrationReport } from './schemas.js';
@@ -42,7 +43,7 @@ export interface RunInspection {
   runId: string;
   task: string;
   changedFiles: string[];
-  selectedTasks: Array<{ taskId: string; file: string }>;
+  selectedTasks: Array<{ taskId: string; file: string; dependencies: string[] }>;
   executionOrder: string[];
   taskOutcomes: NonNullable<OrchestrationReport['task_results']>;
   finalValidation?: OrchestrationReport['combined_checks'];
@@ -192,6 +193,11 @@ async function loadRunBundle(project: string, runId: string): Promise<{ identity
   if (selectedTasks.length === 0 || selectedTasks.some(task => task.operation !== 'modify_existing' || task.file_scope.length !== 1)) {
     throw new Error('Orchestration report does not contain supported existing-file tasks.');
   }
+  const graphOrder = orderTasksByDependencies(selectedTasks).map(task => task.task_id);
+  if (report.mode === 'multi_task' && (
+    JSON.stringify(selectedTasks.map(task => task.task_id)) !== JSON.stringify(graphOrder) ||
+    JSON.stringify(report.execution_order ?? []) !== JSON.stringify(graphOrder)
+  )) throw new Error('Orchestration report contains an invalid or inconsistent dependency execution order.');
   if (!report.execution_report_path || !report.final_patch_path) throw new Error('Orchestration report has no execution report or final patch reference.');
   const executionArtifact = await runArtifact(identity.root, report.execution_report_path, '.json', MAX_JSON_BYTES);
   const local = await readRunArtifact(identity.root, executionArtifact.path);
@@ -275,7 +281,14 @@ export async function inspectOrchestrationRun(project: string, runId: string): P
     const outcomesMatch = outcomes.length === selected.length && outcomes.every((outcome, index) =>
       outcome.task_id === selected[index]?.task_id && outcome.file === selected[index]?.file_scope[0] &&
       outcome.order === index + 1 && outcome.status === 'passed' && outcome.proposal_validation === 'passed');
-    if (JSON.stringify(actualOrder) !== JSON.stringify(expectedOrder) || !outcomesMatch) {
+    const dependencyMetadataMatches = outcomes.every((outcome, index) => {
+      const dependencies = selected[index]?.dependencies ?? [];
+      if (dependencies.length === 0 && outcome.dependencies === undefined) return true;
+      return JSON.stringify(outcome.dependencies) === JSON.stringify(dependencies) &&
+        outcome.authorized_files?.length === 1 && outcome.authorized_files[0] === outcome.file &&
+        Boolean(outcome.started_at && outcome.completed_at && outcome.source_sha256_before && outcome.source_sha256_after);
+    });
+    if (JSON.stringify(actualOrder) !== JSON.stringify(expectedOrder) || !outcomesMatch || !dependencyMetadataMatches) {
       reasons.push('Multi-task execution order or per-task outcomes are incomplete or inconsistent.');
     }
     if (bundle.report.combined_checks?.status !== 'passed') reasons.push('Final combined trusted validation did not pass.');
@@ -304,7 +317,7 @@ export async function inspectOrchestrationRun(project: string, runId: string): P
   }
   const summary = diffSummary(bundle.patch);
   const selectedTasks = (bundle.report.selected_tasks ?? (bundle.report.selected_task ? [bundle.report.selected_task] : []))
-    .map(task => ({ taskId: task.task_id, file: task.file_scope[0]! }));
+    .map(task => ({ taskId: task.task_id, file: task.file_scope[0]!, dependencies: task.dependencies }));
   return {
     runId,
     task: bundle.report.request,
