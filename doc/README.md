@@ -1,6 +1,6 @@
-# Hybrid Coding Agent — Milestone 6C.2
+# Hybrid Coding Agent — Milestone 6D
 
-This project connects a **read-only Cloud Codex supervisor**, a direct **local Ollama proposal/repair worker**, and a **TypeScript policy and execution orchestrator**. Milestone 6A provides one explicitly authorized end-to-end command for a single eligible existing-file task; Milestone 6B adds explicit human approval and controlled application of the exact reviewed patch; Milestone 6C.1 adds sequential execution of two to five independent existing-file tasks in one isolated worktree; and Milestone 6C.2 extends the same signed approval and transactional integration path to their combined patches. It does not execute dependent tasks, run tasks in parallel, commit, push, merge, deploy, or perform cloud coding.
+This project connects a **read-only Cloud Codex supervisor**, a direct **local Ollama proposal/repair worker**, and a **TypeScript policy and execution orchestrator**. Milestone 6A provides one explicitly authorized end-to-end command for a single eligible existing-file task; Milestone 6B adds explicit human approval and controlled application of the exact reviewed patch; Milestones 6C.1–6C.2 add sequential multi-file execution and signed transactional integration; and Milestone 6D validates and executes dependency-aware plans. It does not run tasks in parallel, commit, push, merge, deploy, or perform cloud coding.
 
 ## Prerequisites
 
@@ -68,20 +68,22 @@ Normal execution requires both `--allow-cloud` and `--apply`. A non-dry run with
 ```sh
 npm run dev -- run \
   --project /absolute/path/to/disposable-repository \
-  --task "Update these independent utilities" \
+  --task "Update the utility, its consumer, and related tests" \
   --multi-task \
   --max-tasks 3 \
   --allow-cloud \
   --apply
 ```
 
-Multi-task mode accepts two through five independent tasks. Every task must be deterministically local-eligible, modify exactly one different verified existing file, have no dependencies, and remain outside protected or high-risk domains. The entire plan is rejected before Ollama or worktree execution if any task is unsupported; the orchestrator never silently executes a subset.
+Multi-task mode accepts two through five dependent or independent tasks. Every task must be deterministically local-eligible, modify exactly one different verified existing file, and remain outside protected or high-risk domains. Task IDs must be unique; dependencies must be unique, refer to plan tasks, and cannot be self-referential or cyclic. The host performs a deterministic topological sort, using task ID order whenever multiple tasks are ready. The entire plan is rejected before Ollama or worktree execution if the graph or any task is unsupported; the orchestrator never silently executes a subset.
 
-The coordinator acquires all per-file locks in stable order and creates one detached owned worktree. Tasks execute in plan order, so later applications and trusted checks observe earlier worktree changes. Each proposal is generated from the current authorized file, validated against its current SHA-256 digest, and applied through the existing bounded repair coordinator. Model output cannot add files or commands.
+The coordinator acquires all per-file locks in stable order and creates one detached owned worktree. A task starts only after all declared prerequisites pass, so later applications and trusted checks observe earlier worktree changes. Each proposal is generated from the current authorized file, validated against its fresh worktree-relative SHA-256 digest, and applied through the existing bounded repair coordinator. Model output cannot add files or commands.
 
-Conventional repository-wide validation commands are not assumed safe as per-task checks because a temporarily incomplete multi-task plan may fail them. The CLI therefore defers those checks and repairs until all task proposals have been applied, then runs the complete trusted validation suite once. The programmatic coordinator accepts explicitly scoped `taskCommands`; when supplied, failed task checks may invoke the existing bounded local repair loop. A final combined-check failure never triggers speculative cross-file repair and preserves the shared worktree for inspection.
+For a dependent task, Ollama receives its target file plus read-only excerpts from its **direct** prerequisite files in the shared worktree. These files come only from validated task scopes, are rechecked as regular in-worktree files, and are bounded to 8 KB per file and 20 KB total before prompt sanitization. Transitive dependencies and the rest of the repository are not automatically disclosed. Dependency source is untrusted context and never expands the task's write scope. Repeated file targets remain unsupported in this milestone: the plan is blocked rather than risking an overwrite of an earlier task.
 
-One combined Git diff, one combined execution report, and one final Cloud supervisor review are produced. Planning and final review share the normal two-call default budget; there is no per-task cloud review or cloud coding fallback. Reports record execution order, task/file scopes, proposal and report references, per-task repair/check outcomes, combined checks, patch SHA-256, Cloud usage/review, worktree cleanup state, and human-approval availability.
+Conventional repository-wide validation commands are not assumed safe as per-task checks because a temporarily incomplete dependency chain may fail them. The CLI therefore defers those checks and repairs until all task proposals have been applied, then runs the complete trusted validation suite once. The programmatic coordinator accepts explicitly scoped `taskCommands`; when supplied, failed task checks may invoke the existing bounded local repair loop. A failed prerequisite marks downstream tasks `blocked_by_dependency`; remaining unrelated work is explicitly `blocked_by_policy` under the fail-fast policy. No partial run is approval-eligible. A final combined-check failure never triggers speculative cross-file repair, marks the overall run failed, and preserves the shared worktree for inspection.
+
+One combined Git diff, one combined execution report, and one final Cloud supervisor review are produced. Planning and final review share the normal two-call default budget; there is no per-task cloud review or cloud coding fallback. Reports preserve declared dependencies and computed execution order, and track each task's authorized scope, pending/ready/running/final state, timestamps, source hashes, proposal/report references, repair/check outcomes, and block reason. A task passing does not establish that combined validation or the feature passed.
 
 Combined patches covering two to five authorized files use the same `run inspect`, `run approve`, and `run integrate` workflow as single-file runs. Approval becomes eligible only after all task outcomes and final trusted checks pass and the Cloud review verdict is `ready_for_human_review`. File creation, deletion, rename, copy, binary, mode-changing, and submodule patches remain unsupported.
 
@@ -148,7 +150,7 @@ Create a disposable Git repository with an initial commit, one existing source f
 ## Next milestones
 
 1. Durable crash-recovery journaling for patch integration.
-2. Dependent-task scheduling, parallel execution, and separately authorized remote integration.
+2. Parallel execution and separately authorized remote integration.
 
 ## Security
 
@@ -378,7 +380,8 @@ Cloud-hosted inference may consume OpenAI-hosted usage and requires Codex authen
 - The bounded inventory is intentionally incomplete in very large repositories. If the needed file is omitted, planning reports insufficient context rather than searching outside the allowed context or guessing a path.
 - Source redaction is best effort. The inventory excludes conventional secret locations and credential file types, but repositories should not contain secrets under misleading ordinary source-file names.
 - Default single-task mode still supports exactly one dependency-free existing-file task; create/delete work remains blocked.
-- Sequential multi-task mode supports two to five dependency-free tasks on distinct existing files. Dependencies, overlapping scopes, partial-plan execution, and parallelism are rejected.
+- Sequential multi-task mode supports a validated acyclic graph of two to five tasks on distinct existing files. Repeated file targets, partial-plan integration, and parallel execution are rejected.
+- Dependency context is bounded and limited to direct prerequisite files, but source redaction remains best effort; do not store secrets in ordinary source files.
 - A Cloud review verdict is advisory. It never starts another repair loop, cloud coding task, merge, commit, push, or deployment.
 - Approval/integration supports one to five existing text files. Binary, submodule, mode-changing, rename, copy, creation, and deletion patches are rejected.
 - Integration intentionally leaves every approved change unstaged in the original working tree for manual review and commit.
