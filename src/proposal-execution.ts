@@ -5,7 +5,7 @@ import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { generateDiff, resolveSafeTargetPath, validateProposal, type DiffAnalysis, type ValidationReport } from './proposal-validation.js';
 import { loadTrustedCommands, runTrustedCommand, type CheckResult, type TrustedCommand } from './trusted-checks.js';
 
-export const EXECUTION_PROTECTED_PATHS = ['package.json', '.agent-validation.json', '.agent-runs', '.agent-worktrees'];
+export const EXECUTION_PROTECTED_PATHS = ['package.json', '.agent-validation.json', '.agent-runs', '.agent-worktrees', '.agent-state'];
 
 export interface ExecutionOptions {
   project: string;

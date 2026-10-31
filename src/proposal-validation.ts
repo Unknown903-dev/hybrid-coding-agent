@@ -7,7 +7,7 @@ import { formatSchemaIssues, proposalSchema, type Proposal } from './proposal-sc
 const MAX_PROPOSAL_BYTES = 1_000_000;
 const MAX_SOURCE_BYTES = 200_000;
 const PROTECTED_SEGMENTS = new Set([
-  '.git', '.agent-proposals', '.agent-runs', '.agent-worktrees', '.aws', '.codex', '.ssh', 'node_modules',
+  '.git', '.agent-proposals', '.agent-runs', '.agent-worktrees', '.agent-state', '.aws', '.codex', '.ssh', 'node_modules',
   'dist', 'build', 'coverage',
 ]);
 const PROTECTED_FILES = new Set(['.env', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
@@ -68,12 +68,13 @@ function lineCount(text: string): number {
 function isProtected(relativePath: string, extraProtectedPaths: string[]): boolean {
   const normalized = relativePath.split(sep).join('/');
   const segments = normalized.split('/');
-  const name = segments.at(-1) ?? '';
-  if (segments.some(segment => PROTECTED_SEGMENTS.has(segment))) return true;
+  const normalizedLower = normalized.toLowerCase();
+  const name = (segments.at(-1) ?? '').toLowerCase();
+  if (segments.some(segment => PROTECTED_SEGMENTS.has(segment.toLowerCase()))) return true;
   if (PROTECTED_FILES.has(name) || name.startsWith('.env.') || /\.(?:pem|key|p12|pfx)$/i.test(name)) return true;
   return extraProtectedPaths.some(protectedPath => {
-    const normalizedProtected = protectedPath.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/$/, '');
-    return normalized === normalizedProtected || normalized.startsWith(`${normalizedProtected}/`);
+    const normalizedProtected = protectedPath.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/$/, '').toLowerCase();
+    return normalizedLower === normalizedProtected || normalizedLower.startsWith(`${normalizedProtected}/`);
   });
 }
 
