@@ -296,6 +296,26 @@ describe('structured supervisor planning', () => {
     await expect(validateAndEnforcePlan(unknown)).rejects.toThrow('unknown dependency');
   });
 
+  it('deterministically topologically sorts dependent and independent tasks', async () => {
+    const sorted = await validateAndEnforcePlan(plan([
+      task({ task_id: 'consumer', dependencies: ['utility'] }),
+      task({ task_id: 'z_independent', dependencies: [] }),
+      task({ task_id: 'utility', dependencies: ['base'] }),
+      task({ task_id: 'base', dependencies: [] }),
+    ]));
+    expect(sorted.tasks.map(item => item.task_id)).toEqual(['base', 'utility', 'consumer', 'z_independent']);
+    expect(sorted.tasks.find(item => item.task_id === 'consumer')?.dependencies).toEqual(['utility']);
+  });
+
+  it('rejects self-dependencies and duplicate dependency references', async () => {
+    await expect(validateAndEnforcePlan(plan([task({ task_id: 'self', dependencies: ['self'] })])))
+      .rejects.toThrow(/depend on itself/i);
+    await expect(validateAndEnforcePlan(plan([
+      task({ task_id: 'base' }),
+      task({ task_id: 'consumer', dependencies: ['base', 'base'] }),
+    ]))).rejects.toThrow(/duplicate dependencies/i);
+  });
+
   it('enforces cloud routing for unsupported multi-file and high-risk tasks', async () => {
     const root = await repository();
     await writeFile(join(root, 'src', 'other.ts'), 'export {};\n');
