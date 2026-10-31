@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import { type LocalProposalAdapter, type LocalProposalRequest } from '../src/local-proposal.js';
 import { runOrchestration, type RunCoordinatorOptions } from '../src/orchestration/run-coordinator.js';
+import { approveOrchestrationRun, inspectOrchestrationRun, integrateApprovedRun } from '../src/orchestration/integration.js';
 import { orchestrationReportSchema } from '../src/orchestration/schemas.js';
 import { acquireExecutionLock, releaseExecutionLock } from '../src/proposal-execution.js';
 import type { RepairModelAdapter, RepairRequest } from '../src/repair-coordinator.js';
@@ -169,6 +170,32 @@ async function options(root: string, overrides: Partial<RunCoordinatorOptions> =
 }
 
 describe('end-to-end orchestration coordinator', () => {
+  it('runs, approves, and integrates one authorized new-file task', async () => {
+    const root = await repository();
+    const created = 'export const helper = (value: number) => value * 2;\n';
+    const createPlan = plan([planTask({
+      task_id: 'create_helper', title: 'Create helper', description: 'Create one bounded helper source file.',
+      operation: 'create', file_scope: ['helper.ts'], routing_explanation: 'A justified low-risk source file.',
+      acceptance_criteria: ['The helper exports its function.'], validation_requirements: ['Run helper check.'],
+    })]);
+    const helperCheck: TrustedCommand = {
+      name: 'helper', executable: process.execPath,
+      args: ['-e', "const fs=require('fs');process.exit(fs.readFileSync('helper.ts','utf8').includes('value * 2')?0:1)"],
+      timeout_ms: 5_000, max_output_bytes: 10_000,
+    };
+    const result = await runOrchestration(await options(root, {
+      request: 'Create a helper source file.', commands: [helperCheck],
+      supervisorAdapter: new QueueSupervisor([createPlan, review()]), proposalAdapter: new ProposalAdapter(created),
+    }));
+    expect(result.report.state).toBe('awaiting_human_review');
+    expect(await readFile(result.report.final_patch_path!, 'utf8')).toContain('new file mode 100644');
+    await expect(readFile(join(root, 'helper.ts'))).rejects.toThrow();
+    expect((await inspectOrchestrationRun(root, result.report.run_id)).eligibleForApproval).toBe(true);
+    await approveOrchestrationRun({ project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag' });
+    await integrateApprovedRun({ project: root, runId: result.report.run_id });
+    expect(await readFile(join(root, 'helper.ts'), 'utf8')).toBe(created);
+  });
+
   it('runs a successful single-task workflow and preserves the original repository', async () => {
     const root = await repository();
     const head = await git(root, ['rev-parse', 'HEAD']);

@@ -27,6 +27,8 @@ const formatterOriginal = 'export const format = (value: string) => value.trim()
 const formatterFixed = 'export const format = (value: string) => value.trim().toUpperCase();\n';
 const consumerOriginal = "import { format } from './formatter.js';\nexport const label = (value: string) => format(value);\n";
 const consumerFixed = "import { format } from './formatter.js';\nexport const label = (value: string) => `[${format(value)}]`;\n";
+const discountsCreated = 'export const discount = (value: number) => value * 0.9;\n';
+const formatterWithDiscount = "import { discount } from './discounts.js';\nexport const formatPrice = (value: number) => String(discount(value));\n";
 
 class QueueSupervisor implements CodexSupervisorAdapter {
   readonly requests: SupervisorAdapterRequest[] = [];
@@ -160,6 +162,25 @@ function baseOptions(root: string, overrides: Partial<MultiRunCoordinatorOptions
   };
 }
 
+function mixedOptions(root: string): MultiRunCoordinatorOptions {
+  const proposal: LocalProposalAdapter = { requestProposal: async request => ({
+    summary: `Implement ${request.file}.`,
+    proposed_content: request.file === 'discounts.ts' ? discountsCreated : formatterWithDiscount,
+    checks: ['Not run by model.'], risks: ['Human review required.'],
+  }) };
+  const mixedCheck: TrustedCommand = {
+    name: 'mixed', executable: process.execPath,
+    args: ['-e', "const fs=require('fs');process.exit(fs.readFileSync('discounts.ts','utf8').includes('0.9')&&fs.readFileSync('formatter.ts','utf8').includes('./discounts.js')?0:1)"],
+    timeout_ms: 5_000, max_output_bytes: 10_000,
+  };
+  return baseOptions(root, {
+    supervisorAdapter: new QueueSupervisor([plan([
+      task('update_formatter', 'formatter.ts', { dependencies: ['create_discounts'] }),
+      task('create_discounts', 'discounts.ts', { operation: 'create' }),
+    ]), review()]), proposalAdapter: proposal, commands: [mixedCheck],
+  });
+}
+
 describe('sequential multi-task orchestration', () => {
   it('executes two independent files sequentially in one shared worktree and produces one patch', async () => {
     const root = await repository();
@@ -287,6 +308,87 @@ describe('sequential multi-task orchestration', () => {
     expect(result.report.task_results?.every(taskResult => taskResult.source_sha256_before && taskResult.source_sha256_after)).toBe(true);
     expect(result.report.combined_checks?.status).toBe('passed');
     expect(await readFile(join(root, 'consumer.ts'), 'utf8')).toBe(consumerOriginal);
+  });
+
+  it('creates a new dependency, modifies its consumer, and integrates the exact mixed patch', async () => {
+    const root = await repository();
+    const head = await git(root, ['rev-parse', 'HEAD']);
+    const result = await runMultiTaskOrchestration(mixedOptions(root));
+    expect(result.report.execution_order).toEqual(['create_discounts', 'update_formatter']);
+    expect(result.report.task_results?.map(item => item.operation)).toEqual(['create', 'modify']);
+    expect(result.report.task_results?.[0]?.expected_absent_before).toBe(true);
+    const patch = await readFile(result.report.final_patch_path!, 'utf8');
+    expect(patch).toContain('new file mode 100644');
+    expect(patch).toContain('--- /dev/null');
+    expect(patch).toContain('+++ b/discounts.ts');
+    await expect(readFile(join(root, 'discounts.ts'))).rejects.toThrow();
+    expect(await readFile(join(root, 'formatter.ts'), 'utf8')).toBe(formatterOriginal);
+
+    const inspection = await inspectOrchestrationRun(root, result.report.run_id);
+    expect(inspection.selectedTasks.map(item => item.operation)).toEqual(['create', 'modify']);
+    expect(inspection.eligibleForApproval).toBe(true);
+    const approved = await approveOrchestrationRun({
+      project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag',
+    });
+    expect(approved.record.file_operations).toEqual({ 'formatter.ts': 'modify', 'discounts.ts': 'create' });
+    expect(approved.record.expected_absent).toEqual(['discounts.ts']);
+    expect(await git(root, ['status', '--porcelain', '--untracked-files=all'])).toBe('');
+
+    const integrated = await integrateApprovedRun({ project: root, runId: result.report.run_id });
+    expect(integrated.audit.status).toBe('succeeded');
+    expect(integrated.audit.file_operations).toEqual(approved.record.file_operations);
+    expect(await readFile(join(root, 'discounts.ts'), 'utf8')).toBe(discountsCreated);
+    expect(await readFile(join(root, 'formatter.ts'), 'utf8')).toBe(formatterWithDiscount);
+    expect(await git(root, ['rev-parse', 'HEAD'])).toBe(head);
+    expect(await git(root, ['diff', '--name-only'])).toBe('formatter.ts\n');
+    expect(await git(root, ['status', '--porcelain', '--untracked-files=all'])).toContain('?? discounts.ts');
+  });
+
+  it('rejects a creation destination collision after approval', async () => {
+    const root = await repository();
+    const result = await runMultiTaskOrchestration(mixedOptions(root));
+    await approveOrchestrationRun({ project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag' });
+    await writeFile(join(root, 'discounts.ts'), 'independent user content\n');
+    await expect(integrateApprovedRun({ project: root, runId: result.report.run_id })).rejects.toThrow(/tracked changes|already exists|destination/i);
+    expect(await readFile(join(root, 'discounts.ts'), 'utf8')).toBe('independent user content\n');
+    expect(await readFile(join(root, 'formatter.ts'), 'utf8')).toBe(formatterOriginal);
+  });
+
+  it('rejects tampered signed creation-operation metadata', async () => {
+    const root = await repository();
+    const result = await runMultiTaskOrchestration(mixedOptions(root));
+    const approved = await approveOrchestrationRun({ project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag' });
+    const record = JSON.parse(await readFile(approved.approvalPath, 'utf8')) as Record<string, any>;
+    record.file_operations['discounts.ts'] = 'modify';
+    await writeFile(approved.approvalPath, JSON.stringify(record));
+    await expect(integrateApprovedRun({ project: root, runId: result.report.run_id })).rejects.toThrow(/signature|altered/i);
+    await expect(readFile(join(root, 'discounts.ts'))).rejects.toThrow();
+  });
+
+  it('rolls back both a created file and an existing-file modification after post-application failure', async () => {
+    const root = await repository();
+    const result = await runMultiTaskOrchestration(mixedOptions(root));
+    await approveOrchestrationRun({ project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag' });
+    const wrongModification: PatchApplicationAdapter = { apply: async projectRoot => {
+      await writeFile(join(projectRoot, 'formatter.ts'), 'wrong approved-file content\n');
+    } };
+    await expect(integrateApprovedRun({ project: root, runId: result.report.run_id, adapter: wrongModification })).rejects.toThrow(/exactly match/i);
+    await expect(readFile(join(root, 'discounts.ts'))).rejects.toThrow();
+    expect(await readFile(join(root, 'formatter.ts'), 'utf8')).toBe(formatterOriginal);
+    expect(await git(root, ['status', '--porcelain', '--untracked-files=all'])).toBe('');
+  });
+
+  it('preserves an independently changed creation collision and reports manual recovery', async () => {
+    const root = await repository();
+    const result = await runMultiTaskOrchestration(mixedOptions(root));
+    await approveOrchestrationRun({ project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag' });
+    const collision: PatchApplicationAdapter = { apply: async projectRoot => {
+      await writeFile(join(projectRoot, 'formatter.ts'), formatterWithDiscount);
+      await writeFile(join(projectRoot, 'discounts.ts'), 'external collision\n', { flag: 'wx' });
+    } };
+    await expect(integrateApprovedRun({ project: root, runId: result.report.run_id, adapter: collision })).rejects.toThrow(/Manual recovery required/i);
+    expect(await readFile(join(root, 'discounts.ts'), 'utf8')).toBe('external collision\n');
+    expect(await readFile(join(root, 'formatter.ts'), 'utf8')).toBe(formatterOriginal);
   });
 
   it('rejects protected dependency context before contacting the local worker', async () => {

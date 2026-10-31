@@ -243,15 +243,15 @@ describe('structured supervisor planning', () => {
     expect(inventory.inventory_truncated).toBe(true);
   });
 
-  it('keeps genuine new-file work ineligible for the single-file local worker', async () => {
+  it('allows a low-risk new source file in an existing safe directory', async () => {
     const root = await repository();
     const inventory = await buildRepositoryInventory(root, { request: 'Add a helper file' });
     const enforced = await validateAndEnforcePlan(plan([task({
       operation: 'create', file_scope: ['src/new-helper.ts'], recommended_executor: 'local',
     })]), { projectRoot: root, inventory });
 
-    expect(enforced.tasks[0]?.recommended_executor).toBe('cloud');
-    expect(enforced.routing_policy?.findings[0]?.reasons.join(' ')).toContain('cannot create or delete');
+    expect(enforced.tasks[0]?.recommended_executor).toBe('local');
+    expect(enforced.routing_policy?.findings[0]?.local_eligible).toBe(true);
   });
 
   it('rejects unsafe or unverified model-selected existing paths', async () => {
