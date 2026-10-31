@@ -6,7 +6,7 @@ import { sanitizeCloudText } from './artifacts.js';
 
 const execFileAsync = promisify(execFile);
 const EXCLUDED_SEGMENTS = new Set([
-  '.git', '.agent-runs', '.agent-proposals', '.agent-worktrees', '.aws', '.ssh', '.codex',
+  '.git', '.agent-runs', '.agent-proposals', '.agent-worktrees', '.agent-state', '.aws', '.ssh', '.codex',
   'node_modules', 'dist', 'build', 'coverage',
 ]);
 const EXCLUDED_FILES = new Set([

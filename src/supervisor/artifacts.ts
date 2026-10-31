@@ -75,8 +75,8 @@ function validatePatchScope(patch: string, expectedFile: string): void {
   if (isAbsolute(expectedFile) || expectedFile.split(/[\\/]/).includes('..')) throw new Error('Run report contains an unsafe proposed file path.');
   const normalizedExpected = expectedFile.replaceAll('\\', '/');
   const segments = normalizedExpected.split('/');
-  const name = segments.at(-1) ?? '';
-  if (segments.some(segment => ['.git', '.agent-runs', '.agent-proposals', '.agent-worktrees', '.aws', '.ssh', '.codex', 'node_modules'].includes(segment)) ||
+  const name = (segments.at(-1) ?? '').toLowerCase();
+  if (segments.some(segment => ['.git', '.agent-runs', '.agent-proposals', '.agent-worktrees', '.agent-state', '.aws', '.ssh', '.codex', 'node_modules'].includes(segment.toLowerCase())) ||
       name === '.env' || name.startsWith('.env.') || /\.(?:pem|key|p12|pfx)$/i.test(name)) {
     throw new Error('Run report references a protected patch path.');
   }
