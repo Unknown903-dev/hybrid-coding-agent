@@ -5,6 +5,7 @@ import { access } from 'node:fs/promises';
 import { proposeLocalChange } from './local-proposal.js';
 import { validateProposal, type ValidationReport } from './proposal-validation.js';
 import { executeProposal, type ExecutionReport } from './proposal-execution.js';
+import { coordinateRepair, type RepairReport } from './repair-coordinator.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -21,7 +22,9 @@ const usage = `Usage:
   npm run dev -- validate --project /path/to/repo --proposal .agent-proposals/proposal.json
   npm run dev -- diff --project /path/to/repo --proposal .agent-proposals/proposal.json
   npm run dev -- execute --project /path/to/repo --proposal .agent-proposals/proposal.json --apply
-  npm run dev -- execute --project /path/to/repo --proposal .agent-proposals/proposal.json --apply --keep-worktree`;
+  npm run dev -- execute --project /path/to/repo --proposal .agent-proposals/proposal.json --apply --keep-worktree
+  npm run dev -- repair --project /path/to/repo --proposal .agent-proposals/proposal.json --apply --max-retries 2
+  npm run dev -- repair --project /path/to/repo --proposal .agent-proposals/proposal.json --apply --keep-worktree`;
 
 async function checkProject() {
   await access(resolve(project, '.git')).catch(() => { throw new Error(`Not a Git repository: ${project}`); });
@@ -41,6 +44,12 @@ function optionalNumber(name: string): number | undefined {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`${name} must be a non-negative number.`);
   return parsed;
+}
+
+function optionalInteger(name: string): number | undefined {
+  const value = optionalNumber(name);
+  if (value !== undefined && !Number.isInteger(value)) throw new Error(`${name} must be an integer.`);
+  return value;
 }
 
 function printValidationReport(report: ValidationReport): void {
@@ -75,17 +84,53 @@ function printExecutionReport(report: ExecutionReport): void {
   if (report.report_path) console.log(`Report: ${report.report_path}`);
 }
 
+function printRepairReport(report: RepairReport): void {
+  console.log(report.status === 'passed' ? 'REPAIR PASSED: all trusted checks passed.' : 'REPAIR FAILED.');
+  console.log(`Task ID: ${report.task_id}`);
+  console.log(`Stop reason: ${report.stop_reason}`);
+  console.log(`Repair attempts: ${report.repair_attempts_used}/${report.max_repair_attempts}`);
+  console.log(`Proposal validity: ${report.proposal_validity}`);
+  console.log(`Automated checks: ${report.automated_checks}`);
+  for (const attempt of report.attempts) {
+    console.log(`ATTEMPT ${attempt.attempt}: ${attempt.kind}, proposal ${attempt.proposal_valid ? 'valid' : 'invalid'}, checks ${attempt.checks_status}`);
+  }
+  if (report.worktree.location) {
+    console.log(`Worktree: ${report.worktree.location} (${report.worktree.preserved ? 'preserved' : 'cleaned'})`);
+  }
+  if (report.final_patch_path) console.log(`Patch: ${report.final_patch_path}`);
+  for (const error of report.errors) console.log(`ERROR: ${error}`);
+  console.log(`Cloud escalation recommended: ${report.cloud_escalation_recommended ? 'yes' : 'no'}`);
+  console.log('Semantic review: required; passing checks does not guarantee task correctness.');
+  if (report.report_path) console.log(`Report: ${report.report_path}`);
+}
+
 async function main() {
   const taskCommands = ['plan', 'local', 'propose'];
   const proposalCommands = ['validate', 'diff'];
-  const supportedCommands = [...taskCommands, ...proposalCommands, 'execute'];
+  const supportedCommands = [...taskCommands, ...proposalCommands, 'execute', 'repair'];
   if (!supportedCommands.includes(command ?? '') || (taskCommands.includes(command ?? '') && !task)) {
     console.log(usage);
     process.exitCode = 1;
     return;
   }
   await checkProject();
-  if (command === 'execute') {
+  if (command === 'repair') {
+    const proposalPath = getArg('--proposal');
+    if (!proposalPath) throw new Error('repair requires --proposal <path>');
+    if (!args.includes('--apply')) throw new Error('repair requires explicit authorization with --apply');
+    const preview = await validateProposal({ project, proposalPath });
+    if (preview.proposal) console.log(`Proposal summary: ${preview.proposal.summary}`);
+    const report = await coordinateRepair({
+      project,
+      proposalPath,
+      apply: true,
+      keepWorktree: args.includes('--keep-worktree'),
+      maxRetries: optionalInteger('--max-retries'),
+      totalTimeBudgetMs: optionalInteger('--time-budget-ms'),
+    });
+    printRepairReport(report);
+    if (report.status !== 'passed') process.exitCode = 1;
+  } else if (command === 'execute') {
     const proposalPath = getArg('--proposal');
     if (!proposalPath) throw new Error('execute requires --proposal <path>');
     if (!args.includes('--apply')) throw new Error('execute requires explicit authorization with --apply');
