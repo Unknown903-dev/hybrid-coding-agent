@@ -5,7 +5,7 @@ import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { generateDiff, resolveSafeTargetPath, validateProposal, type DiffAnalysis, type ValidationReport } from './proposal-validation.js';
 import { loadTrustedCommands, runTrustedCommand, type CheckResult, type TrustedCommand } from './trusted-checks.js';
 
-const EXECUTION_PROTECTED_PATHS = ['package.json', '.agent-validation.json', '.agent-runs', '.agent-worktrees'];
+export const EXECUTION_PROTECTED_PATHS = ['package.json', '.agent-validation.json', '.agent-runs', '.agent-worktrees'];
 
 export interface ExecutionOptions {
   project: string;
@@ -106,7 +106,7 @@ async function writeReport(projectRoot: string, report: ExecutionReport): Promis
   return path;
 }
 
-async function acquireLock(projectRoot: string, key: string, taskId: string): Promise<{ handle: FileHandle; path: string }> {
+export async function acquireExecutionLock(projectRoot: string, key: string, taskId: string): Promise<{ handle: FileHandle; path: string }> {
   const locks = resolve(projectRoot, '.agent-runs', '.locks');
   await mkdir(locks, { recursive: true, mode: 0o700 });
   const path = resolve(locks, `${createHash('sha256').update(key).digest('hex')}.lock`);
@@ -122,7 +122,7 @@ async function acquireLock(projectRoot: string, key: string, taskId: string): Pr
   }
 }
 
-async function releaseLock(lock: { handle: FileHandle; path: string } | undefined): Promise<void> {
+export async function releaseExecutionLock(lock: { handle: FileHandle; path: string } | undefined): Promise<void> {
   if (!lock) return;
   await lock.handle.close().catch(() => undefined);
   await unlink(lock.path).catch(() => undefined);
@@ -200,7 +200,7 @@ export async function executeProposal(options: ExecutionOptions): Promise<Execut
       throw new Error('Proposal is stale: the original source file changed after proposal generation.');
     }
 
-    lock = await acquireLock(projectRoot, `${projectRoot}\0${validation.proposal.file}`, taskId);
+    lock = await acquireExecutionLock(projectRoot, `${projectRoot}\0${validation.proposal.file}`, taskId);
     const commands = options.commands ?? await loadTrustedCommands(projectRoot);
 
     await mkdir(worktreeRoot, { recursive: true, mode: 0o700 });
@@ -281,7 +281,7 @@ export async function executeProposal(options: ExecutionOptions): Promise<Execut
     } else if (worktreeCreated) {
       report.worktree.preserved = true;
     }
-    await releaseLock(lock);
+    await releaseExecutionLock(lock);
     report.completed_at = new Date().toISOString();
     await writeReport(projectRoot, report);
   }
