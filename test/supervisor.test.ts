@@ -243,15 +243,15 @@ describe('structured supervisor planning', () => {
     expect(inventory.inventory_truncated).toBe(true);
   });
 
-  it('keeps genuine new-file work ineligible for the single-file local worker', async () => {
+  it('allows a low-risk new source file in an existing safe directory', async () => {
     const root = await repository();
     const inventory = await buildRepositoryInventory(root, { request: 'Add a helper file' });
     const enforced = await validateAndEnforcePlan(plan([task({
       operation: 'create', file_scope: ['src/new-helper.ts'], recommended_executor: 'local',
     })]), { projectRoot: root, inventory });
 
-    expect(enforced.tasks[0]?.recommended_executor).toBe('cloud');
-    expect(enforced.routing_policy?.findings[0]?.reasons.join(' ')).toContain('cannot create or delete');
+    expect(enforced.tasks[0]?.recommended_executor).toBe('local');
+    expect(enforced.routing_policy?.findings[0]?.local_eligible).toBe(true);
   });
 
   it('rejects unsafe or unverified model-selected existing paths', async () => {
@@ -294,6 +294,26 @@ describe('structured supervisor planning', () => {
 
     await expect(validateAndEnforcePlan(circular)).rejects.toBeInstanceOf(PlanValidationError);
     await expect(validateAndEnforcePlan(unknown)).rejects.toThrow('unknown dependency');
+  });
+
+  it('deterministically topologically sorts dependent and independent tasks', async () => {
+    const sorted = await validateAndEnforcePlan(plan([
+      task({ task_id: 'consumer', dependencies: ['utility'] }),
+      task({ task_id: 'z_independent', dependencies: [] }),
+      task({ task_id: 'utility', dependencies: ['base'] }),
+      task({ task_id: 'base', dependencies: [] }),
+    ]));
+    expect(sorted.tasks.map(item => item.task_id)).toEqual(['base', 'utility', 'consumer', 'z_independent']);
+    expect(sorted.tasks.find(item => item.task_id === 'consumer')?.dependencies).toEqual(['utility']);
+  });
+
+  it('rejects self-dependencies and duplicate dependency references', async () => {
+    await expect(validateAndEnforcePlan(plan([task({ task_id: 'self', dependencies: ['self'] })])))
+      .rejects.toThrow(/depend on itself/i);
+    await expect(validateAndEnforcePlan(plan([
+      task({ task_id: 'base' }),
+      task({ task_id: 'consumer', dependencies: ['base', 'base'] }),
+    ]))).rejects.toThrow(/duplicate dependencies/i);
   });
 
   it('enforces cloud routing for unsupported multi-file and high-risk tasks', async () => {

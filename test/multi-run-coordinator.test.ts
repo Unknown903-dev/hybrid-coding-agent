@@ -25,6 +25,10 @@ const calculatorOriginal = 'export function add(a: number, b: number) { return a
 const calculatorFixed = 'export function add(a: number, b: number) { return a + b; }\n';
 const formatterOriginal = 'export const format = (value: string) => value.trim();\n';
 const formatterFixed = 'export const format = (value: string) => value.trim().toUpperCase();\n';
+const consumerOriginal = "import { format } from './formatter.js';\nexport const label = (value: string) => format(value);\n";
+const consumerFixed = "import { format } from './formatter.js';\nexport const label = (value: string) => `[${format(value)}]`;\n";
+const discountsCreated = 'export const discount = (value: number) => value * 0.9;\n';
+const formatterWithDiscount = "import { discount } from './discounts.js';\nexport const formatPrice = (value: number) => String(discount(value));\n";
 
 class QueueSupervisor implements CodexSupervisorAdapter {
   readonly requests: SupervisorAdapterRequest[] = [];
@@ -49,7 +53,7 @@ class MultiProposalAdapter implements LocalProposalAdapter {
     this.requests.push(request);
     await this.hook?.(request, index);
     if (this.failAt === index) throw new Error('mock local generation failure');
-    const content = request.file === 'calculator.ts' ? calculatorFixed : formatterFixed;
+    const content = request.file === 'calculator.ts' ? calculatorFixed : request.file === 'formatter.ts' ? formatterFixed : consumerFixed;
     return { summary: `Update ${request.file}.`, proposed_content: content, checks: ['Not run by model.'], risks: ['Human review required.'] };
   }
 }
@@ -86,8 +90,10 @@ async function repository(): Promise<string> {
   temporaryDirectories.push(root);
   await git(root, ['init', '--quiet']);
   await writeFile(join(root, '.gitignore'), '.agent-runs/\n.agent-proposals/\n.agent-worktrees/\n.agent-state/\n');
+  await writeFile(join(root, 'package.json'), '{"private":true}\n');
   await writeFile(join(root, 'calculator.ts'), calculatorOriginal);
   await writeFile(join(root, 'formatter.ts'), formatterOriginal);
+  await writeFile(join(root, 'consumer.ts'), consumerOriginal);
   await git(root, ['add', '.']);
   await git(root, ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--quiet', '-m', 'initial']);
   return root;
@@ -139,6 +145,14 @@ function sequentialTaskCheck(): TrustedCommand {
   };
 }
 
+function threeFileCheck(): TrustedCommand {
+  return {
+    name: 'three-file', executable: process.execPath,
+    args: ['-e', `const fs=require('fs');const a=fs.readFileSync('calculator.ts','utf8');const b=fs.readFileSync('formatter.ts','utf8');const c=fs.readFileSync('consumer.ts','utf8');process.exit(a.includes('a + b')&&b.includes('toUpperCase')&&c.includes('format(value)}]')?0:1)`],
+    timeout_ms: 5_000, max_output_bytes: 10_000,
+  };
+}
+
 function baseOptions(root: string, overrides: Partial<MultiRunCoordinatorOptions> = {}): MultiRunCoordinatorOptions {
   return {
     project: root, request: 'Update the calculator and formatter utilities.', apply: true, cloudAuthorized: true,
@@ -146,6 +160,25 @@ function baseOptions(root: string, overrides: Partial<MultiRunCoordinatorOptions
     supervisorAdapter: new QueueSupervisor([plan(), review()]), proposalAdapter: new MultiProposalAdapter(),
     repairAdapter: new NoRepairAdapter(), commands: [combinedCheck()], ...overrides,
   };
+}
+
+function mixedOptions(root: string): MultiRunCoordinatorOptions {
+  const proposal: LocalProposalAdapter = { requestProposal: async request => ({
+    summary: `Implement ${request.file}.`,
+    proposed_content: request.file === 'discounts.ts' ? discountsCreated : formatterWithDiscount,
+    checks: ['Not run by model.'], risks: ['Human review required.'],
+  }) };
+  const mixedCheck: TrustedCommand = {
+    name: 'mixed', executable: process.execPath,
+    args: ['-e', "const fs=require('fs');process.exit(fs.readFileSync('discounts.ts','utf8').includes('0.9')&&fs.readFileSync('formatter.ts','utf8').includes('./discounts.js')?0:1)"],
+    timeout_ms: 5_000, max_output_bytes: 10_000,
+  };
+  return baseOptions(root, {
+    supervisorAdapter: new QueueSupervisor([plan([
+      task('update_formatter', 'formatter.ts', { dependencies: ['create_discounts'] }),
+      task('create_discounts', 'discounts.ts', { operation: 'create' }),
+    ]), review()]), proposalAdapter: proposal, commands: [mixedCheck],
+  });
 }
 
 describe('sequential multi-task orchestration', () => {
@@ -221,17 +254,26 @@ describe('sequential multi-task orchestration', () => {
     expect(proposal.requests).toHaveLength(0);
   });
 
-  it('rejects dependencies and high-risk tasks without partial execution', async () => {
+  it('executes a valid dependency chain and still rejects high-risk tasks', async () => {
     const dependencyRoot = await repository();
     const dependencyProposal = new MultiProposalAdapter();
     const dependency = await runMultiTaskOrchestration(baseOptions(dependencyRoot, {
       supervisorAdapter: new QueueSupervisor([plan([
         task('first', 'calculator.ts'), task('second', 'formatter.ts', { dependencies: ['first'] }),
-      ])]), proposalAdapter: dependencyProposal,
+      ]), review()]), proposalAdapter: dependencyProposal,
     }));
-    expect(dependency.report.state).toBe('blocked');
-    expect(dependency.report.failure_reason).toContain('dependencies');
-    expect(dependencyProposal.requests).toHaveLength(0);
+    expect(dependency.report.state).toBe('awaiting_human_review');
+    expect(dependency.report.execution_order).toEqual(['first', 'second']);
+    expect(dependency.report.task_results?.map(result => result.status)).toEqual(['passed', 'passed']);
+    expect(dependency.report.task_results?.[1]?.dependencies).toEqual(['first']);
+    expect(dependencyProposal.requests[1]?.task).toContain('Dependency task: first');
+    expect(dependencyProposal.requests[1]?.task).toContain('return a + b');
+    const dependencyInspection = await inspectOrchestrationRun(dependencyRoot, dependency.report.run_id);
+    expect(dependencyInspection.eligibleForApproval).toBe(true);
+    const dependencyApproval = await approveOrchestrationRun({
+      project: dependencyRoot, runId: dependency.report.run_id, authorized: true, authorizationMethod: 'explicit_flag',
+    });
+    expect(dependencyApproval.record.approved_files).toEqual(['calculator.ts', 'formatter.ts']);
 
     const riskRoot = await repository();
     const riskProposal = new MultiProposalAdapter();
@@ -243,6 +285,125 @@ describe('sequential multi-task orchestration', () => {
     }));
     expect(risky.report.state).toBe('blocked');
     expect(riskProposal.requests).toHaveLength(0);
+  });
+
+  it('topologically executes a three-task chain in one shared worktree', async () => {
+    const root = await repository();
+    const proposal = new MultiProposalAdapter();
+    const result = await runMultiTaskOrchestration(baseOptions(root, {
+      supervisorAdapter: new QueueSupervisor([plan([
+        task('update_consumer', 'consumer.ts', { dependencies: ['update_formatter'] }),
+        task('update_formatter', 'formatter.ts', { dependencies: ['fix_calculator'] }),
+        task('fix_calculator', 'calculator.ts'),
+      ]), review()]),
+      proposalAdapter: proposal,
+      commands: [threeFileCheck()],
+    }));
+    expect(result.report.execution_order).toEqual(['fix_calculator', 'update_formatter', 'update_consumer']);
+    expect(proposal.requests.map(request => request.file)).toEqual(['calculator.ts', 'formatter.ts', 'consumer.ts']);
+    expect(proposal.requests[2]?.task).toContain('Dependency task: update_formatter');
+    expect(proposal.requests[2]?.task).toContain('toUpperCase');
+    expect(proposal.requests[2]?.task).not.toContain('return a + b');
+    expect(result.report.task_results?.every(taskResult => taskResult.status === 'passed')).toBe(true);
+    expect(result.report.task_results?.every(taskResult => taskResult.source_sha256_before && taskResult.source_sha256_after)).toBe(true);
+    expect(result.report.combined_checks?.status).toBe('passed');
+    expect(await readFile(join(root, 'consumer.ts'), 'utf8')).toBe(consumerOriginal);
+  });
+
+  it('creates a new dependency, modifies its consumer, and integrates the exact mixed patch', async () => {
+    const root = await repository();
+    const head = await git(root, ['rev-parse', 'HEAD']);
+    const result = await runMultiTaskOrchestration(mixedOptions(root));
+    expect(result.report.execution_order).toEqual(['create_discounts', 'update_formatter']);
+    expect(result.report.task_results?.map(item => item.operation)).toEqual(['create', 'modify']);
+    expect(result.report.task_results?.[0]?.expected_absent_before).toBe(true);
+    const patch = await readFile(result.report.final_patch_path!, 'utf8');
+    expect(patch).toContain('new file mode 100644');
+    expect(patch).toContain('--- /dev/null');
+    expect(patch).toContain('+++ b/discounts.ts');
+    await expect(readFile(join(root, 'discounts.ts'))).rejects.toThrow();
+    expect(await readFile(join(root, 'formatter.ts'), 'utf8')).toBe(formatterOriginal);
+
+    const inspection = await inspectOrchestrationRun(root, result.report.run_id);
+    expect(inspection.selectedTasks.map(item => item.operation)).toEqual(['create', 'modify']);
+    expect(inspection.eligibleForApproval).toBe(true);
+    const approved = await approveOrchestrationRun({
+      project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag',
+    });
+    expect(approved.record.file_operations).toEqual({ 'formatter.ts': 'modify', 'discounts.ts': 'create' });
+    expect(approved.record.expected_absent).toEqual(['discounts.ts']);
+    expect(await git(root, ['status', '--porcelain', '--untracked-files=all'])).toBe('');
+
+    const integrated = await integrateApprovedRun({ project: root, runId: result.report.run_id });
+    expect(integrated.audit.status).toBe('succeeded');
+    expect(integrated.audit.file_operations).toEqual(approved.record.file_operations);
+    expect(await readFile(join(root, 'discounts.ts'), 'utf8')).toBe(discountsCreated);
+    expect(await readFile(join(root, 'formatter.ts'), 'utf8')).toBe(formatterWithDiscount);
+    expect(await git(root, ['rev-parse', 'HEAD'])).toBe(head);
+    expect(await git(root, ['diff', '--name-only'])).toBe('formatter.ts\n');
+    expect(await git(root, ['status', '--porcelain', '--untracked-files=all'])).toContain('?? discounts.ts');
+  });
+
+  it('rejects a creation destination collision after approval', async () => {
+    const root = await repository();
+    const result = await runMultiTaskOrchestration(mixedOptions(root));
+    await approveOrchestrationRun({ project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag' });
+    await writeFile(join(root, 'discounts.ts'), 'independent user content\n');
+    await expect(integrateApprovedRun({ project: root, runId: result.report.run_id })).rejects.toThrow(/tracked changes|already exists|destination/i);
+    expect(await readFile(join(root, 'discounts.ts'), 'utf8')).toBe('independent user content\n');
+    expect(await readFile(join(root, 'formatter.ts'), 'utf8')).toBe(formatterOriginal);
+  });
+
+  it('rejects tampered signed creation-operation metadata', async () => {
+    const root = await repository();
+    const result = await runMultiTaskOrchestration(mixedOptions(root));
+    const approved = await approveOrchestrationRun({ project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag' });
+    const record = JSON.parse(await readFile(approved.approvalPath, 'utf8')) as Record<string, any>;
+    record.file_operations['discounts.ts'] = 'modify';
+    await writeFile(approved.approvalPath, JSON.stringify(record));
+    await expect(integrateApprovedRun({ project: root, runId: result.report.run_id })).rejects.toThrow(/signature|altered/i);
+    await expect(readFile(join(root, 'discounts.ts'))).rejects.toThrow();
+  });
+
+  it('rolls back both a created file and an existing-file modification after post-application failure', async () => {
+    const root = await repository();
+    const result = await runMultiTaskOrchestration(mixedOptions(root));
+    await approveOrchestrationRun({ project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag' });
+    const wrongModification: PatchApplicationAdapter = { apply: async projectRoot => {
+      await writeFile(join(projectRoot, 'formatter.ts'), 'wrong approved-file content\n');
+    } };
+    await expect(integrateApprovedRun({ project: root, runId: result.report.run_id, adapter: wrongModification })).rejects.toThrow(/exactly match/i);
+    await expect(readFile(join(root, 'discounts.ts'))).rejects.toThrow();
+    expect(await readFile(join(root, 'formatter.ts'), 'utf8')).toBe(formatterOriginal);
+    expect(await git(root, ['status', '--porcelain', '--untracked-files=all'])).toBe('');
+  });
+
+  it('preserves an independently changed creation collision and reports manual recovery', async () => {
+    const root = await repository();
+    const result = await runMultiTaskOrchestration(mixedOptions(root));
+    await approveOrchestrationRun({ project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag' });
+    const collision: PatchApplicationAdapter = { apply: async projectRoot => {
+      await writeFile(join(projectRoot, 'formatter.ts'), formatterWithDiscount);
+      await writeFile(join(projectRoot, 'discounts.ts'), 'external collision\n', { flag: 'wx' });
+    } };
+    await expect(integrateApprovedRun({ project: root, runId: result.report.run_id, adapter: collision })).rejects.toThrow(/Manual recovery required/i);
+    expect(await readFile(join(root, 'discounts.ts'), 'utf8')).toBe('external collision\n');
+    expect(await readFile(join(root, 'formatter.ts'), 'utf8')).toBe(formatterOriginal);
+  });
+
+  it('rejects protected dependency context before contacting the local worker', async () => {
+    const root = await repository();
+    const proposal = new MultiProposalAdapter();
+    const result = await runMultiTaskOrchestration(baseOptions(root, {
+      supervisorAdapter: new QueueSupervisor([plan([
+        task('protected_base', 'package.json'),
+        task('consumer', 'formatter.ts', { dependencies: ['protected_base'] }),
+      ])]),
+      proposalAdapter: proposal,
+    }));
+    expect(result.report.state).toBe('blocked');
+    expect(result.report.failure_reason).toMatch(/protected|unsafe/i);
+    expect(proposal.requests).toHaveLength(0);
   });
 
   it('rejects a stale proposal digest and preserves the shared worktree', async () => {
@@ -272,10 +433,17 @@ describe('sequential multi-task orchestration', () => {
 
   it('stops on failed task-level validation and preserves the worktree', async () => {
     const root = await repository();
-    const result = await runMultiTaskOrchestration(baseOptions(root, { taskCommands: [combinedCheck(false)] }));
+    const result = await runMultiTaskOrchestration(baseOptions(root, {
+      supervisorAdapter: new QueueSupervisor([plan([
+        task('first', 'calculator.ts'), task('second', 'formatter.ts', { dependencies: ['first'] }),
+      ])]),
+      taskCommands: [combinedCheck(false)],
+    }));
     expect(result.report.state).toBe('failed');
     expect(result.report.task_results?.[0]?.automated_checks).toBe('failed');
-    expect(result.report.task_results).toHaveLength(1);
+    expect(result.report.task_results).toHaveLength(2);
+    expect(result.report.task_results?.[1]?.status).toBe('blocked_by_dependency');
+    expect(result.report.task_results?.[1]?.blocked_reason).toContain('first');
     expect(result.report.worktree?.preserved).toBe(true);
   });
 
@@ -285,10 +453,14 @@ describe('sequential multi-task orchestration', () => {
     const result = await runMultiTaskOrchestration(baseOptions(root, { commands: [combinedCheck(false)], supervisorAdapter: supervisor }));
     expect(result.report.combined_checks?.status).toBe('failed');
     expect(result.report.validation.automated_checks).toBe('failed');
+    expect(result.report.state).toBe('failed');
     expect(result.report.worktree?.preserved).toBe(true);
     expect(result.report.final_patch_path).toBeTruthy();
     expect(result.report.final_review.verdict).toBe('retry_local');
     expect(supervisor.requests.map(request => request.operation)).toEqual(['plan', 'review']);
+    const inspection = await inspectOrchestrationRun(root, result.report.run_id);
+    expect(inspection.eligibleForApproval).toBe(false);
+    expect(inspection.ineligibilityReasons.join(' ')).toMatch(/state|validation|checks/i);
   });
 
   it('enforces the shared two-call budget and retains the combined patch when review is unavailable', async () => {

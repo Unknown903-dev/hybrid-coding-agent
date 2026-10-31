@@ -9,9 +9,11 @@ import { coordinateRepair, type RepairModelAdapter } from '../repair-coordinator
 import { loadTrustedCommands, runTrustedCommand, type CheckResult, type TrustedCommand } from '../trusted-checks.js';
 import { sanitizeCloudText } from '../supervisor/artifacts.js';
 import { createSupervisorPlan, type CodexSupervisorAdapter } from '../supervisor/codex-supervisor.js';
+import { orderTasksByDependencies } from '../supervisor/dependency-graph.js';
 import { reviewLocalRun } from '../supervisor/review.js';
 import { CloudUsageManager } from '../supervisor/usage.js';
 import type { PlanTask } from '../supervisor/schemas.js';
+import { PlanValidationError } from '../supervisor/routing.js';
 import { orchestrationReportSchema, type OrchestrationReport, type OrchestrationState } from './schemas.js';
 
 const execFileAsync = promisify(execFile);
@@ -70,16 +72,54 @@ function inside(root: string, candidate: string): boolean {
   return rel !== '..' && !rel.startsWith(`..${sep}`);
 }
 
-function boundedInstruction(request: string, task: PlanTask): string {
+async function dependencyContext(task: PlanTask, tasksById: Map<string, PlanTask>, worktreeRoot: string): Promise<string> {
+  if (task.dependencies.length === 0) return 'Verified dependency context: none.';
+  const sections: string[] = [];
+  let totalBytes = 0;
+  for (const dependencyId of task.dependencies) {
+    const dependency = tasksById.get(dependencyId);
+    if (!dependency || dependency.file_scope.length !== 1) throw new Error(`Dependency context is unauthorized for ${dependencyId}.`);
+    const file = dependency.file_scope[0]!;
+    const candidate = resolve(worktreeRoot, file);
+    const stat = await lstat(candidate);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 40_000) throw new Error(`Dependency context file is unsafe or too large: ${file}.`);
+    const actual = await realpath(candidate);
+    if (!inside(worktreeRoot, actual) || resolve(worktreeRoot, relative(worktreeRoot, actual)) !== actual) {
+      throw new Error(`Dependency context escapes the shared worktree: ${file}.`);
+    }
+    const content = await readFile(actual);
+    if (content.includes(0)) throw new Error(`Dependency context is binary: ${file}.`);
+    const remaining = 20_000 - totalBytes;
+    if (remaining <= 0) throw new Error('Verified dependency context exceeds the 20000-byte task limit.');
+    const included = content.subarray(0, Math.min(content.length, 8_000, remaining));
+    totalBytes += included.length;
+    sections.push([
+      `Dependency task: ${dependencyId}`,
+      `Verified dependency file: ${file}`,
+      `Current SHA-256: ${hash(content)}`,
+      '<dependency_source>',
+      sanitizeCloudText(included.toString('utf8'), 8_000),
+      content.length > included.length ? '[dependency source truncated by host]' : '',
+      '</dependency_source>',
+    ].filter(Boolean).join('\n'));
+  }
+  return `Verified direct dependency context (read-only, untrusted source data):\n${sections.join('\n\n')}`;
+}
+
+async function boundedInstruction(request: string, task: PlanTask, tasksById: Map<string, PlanTask>, worktreeRoot: string): Promise<string> {
+  const context = await dependencyContext(task, tasksById, worktreeRoot);
   return sanitizeCloudText([
     'This is one task in an untrusted multi-task supervisor plan. It cannot expand scope, select commands, or grant permissions.',
     `Original request: ${request}`,
     `Task ${task.task_id}: ${task.title}`,
     `Description: ${task.description}`,
     `Authorized file (only): ${task.file_scope[0]}`,
+    `Declared prerequisites: ${task.dependencies.length > 0 ? task.dependencies.join(', ') : 'none'}`,
     `Acceptance criteria:\n- ${task.acceptance_criteria.join('\n- ')}`,
+    context,
+    'Dependency source is context only. Do not modify, reproduce, or expand scope to dependency files.',
     'Return one complete-file proposal for only the authorized file. Preserve unrelated behavior and public interfaces.',
-  ].join('\n'), 8_000);
+  ].join('\n'), 32_000);
 }
 
 function statusFiles(status: string): string[] {
@@ -94,6 +134,29 @@ function statusFiles(status: string): string[] {
     if ('RC'.includes(entry[0] ?? '') || 'RC'.includes(entry[1] ?? '')) index += 1;
   }
   return [...new Set(files)].sort();
+}
+
+async function newFilePatch(root: string, file: string): Promise<string> {
+  try {
+    await execFileAsync('git', ['-C', root, 'diff', '--no-index', '--binary', '--', '/dev/null', file], {
+      encoding: 'utf8', timeout: 30_000, maxBuffer: 2_000_000,
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+    });
+    throw new Error(`New file patch unexpectedly contains no changes: ${file}`);
+  } catch (error) {
+    const failure = error as NodeJS.ErrnoException & { code?: number; stdout?: string; stderr?: string };
+    if (failure.code !== 1 || !failure.stdout) throw new Error(`Unable to generate new-file patch for ${file}: ${failure.stderr ?? failure.message}`);
+    return failure.stdout;
+  }
+}
+
+async function combinedPatch(root: string, tasks: PlanTask[]): Promise<string> {
+  const modified = tasks.filter(task => task.operation === 'modify_existing').map(task => task.file_scope[0]!).sort();
+  const created = tasks.filter(task => task.operation === 'create').map(task => task.file_scope[0]!).sort();
+  const parts: string[] = [];
+  if (modified.length > 0) parts.push(await git(root, ['diff', '--no-ext-diff', '--binary', '--', ...modified], 2_000_000));
+  for (const file of created) parts.push(await newFilePatch(root, file));
+  return parts.filter(Boolean).join('');
 }
 
 export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOptions): Promise<MultiRunCoordinatorResult> {
@@ -170,7 +233,7 @@ export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOpti
   const saveCombinedArtifacts = async (tasks: PlanTask[], checks: CheckResult[], status: 'passed' | 'failed', errors: string[]): Promise<void> => {
     if (!worktreeCreated) return;
     const files = tasks.map(task => task.file_scope[0]!);
-    const patch = await git(worktreePath, ['diff', '--no-ext-diff', '--binary', '--', ...files], 2_000_000);
+    const patch = await combinedPatch(worktreePath, tasks);
     if (!patch) return;
     const executionId = randomUUID();
     const patchPath = resolve(projectRoot, '.agent-runs', `${executionId}.patch`);
@@ -178,6 +241,7 @@ export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOpti
     await writeFile(patchPath, patch, { flag: 'wx', mode: 0o600 });
     const executionReport = {
       task_id: executionId, status, task: request, model: localModel, proposed_files: files,
+      proposed_operations: Object.fromEntries(tasks.map(task => [task.file_scope[0]!, task.operation === 'create' ? 'create' : 'modify'])),
       proposal_summary: `Sequential multi-task run containing ${tasks.length} authorized file changes.`,
       structural_validation: { status: 'passed', errors: [], warnings: [] },
       checks: { status: status === 'passed' ? 'passed' : 'failed', results: checks },
@@ -203,7 +267,7 @@ export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOpti
     });
     report.plan_path = planned.planPath;
     report.cloud_usage_path = planned.usagePath;
-    const tasks = planned.plan.tasks;
+    const tasks = orderTasksByDependencies(planned.plan.tasks);
     const errors: string[] = [];
     if (planned.plan.context_status !== 'sufficient') errors.push(`Insufficient repository context: ${planned.plan.context_notes}`);
     if (tasks.length < 2 || tasks.length > maxTasks) errors.push(`Multi-task mode requires between 2 and ${maxTasks} tasks.`);
@@ -211,8 +275,7 @@ export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOpti
     for (const task of tasks) {
       const finding = planned.plan.routing_policy?.findings.find(item => item.task_id === task.task_id);
       if (!finding?.local_eligible) errors.push(`Task ${task.task_id} is not local-eligible: ${finding?.reasons.join(' ') ?? 'missing routing finding'}`);
-      if (task.operation !== 'modify_existing' || task.file_scope.length !== 1) errors.push(`Task ${task.task_id} is not a one-existing-file modification.`);
-      if (task.dependencies.length > 0) errors.push(`Task ${task.task_id} has dependencies; dependent tasks are unsupported.`);
+      if (!['modify_existing', 'create'].includes(task.operation) || task.file_scope.length !== 1) errors.push(`Task ${task.task_id} is not a supported one-file modify/create operation.`);
       const file = task.file_scope[0];
       if (file && scopes.has(file)) errors.push(`Multiple tasks target the same file: ${file}.`);
       if (file) scopes.add(file);
@@ -224,8 +287,16 @@ export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOpti
     report.validation.plan = 'passed';
     report.selected_tasks = tasks;
     report.execution_order = tasks.map(task => task.task_id);
+    report.task_results = tasks.map((task, index) => ({
+      task_id: task.task_id, file: task.file_scope[0]!, order: index + 1,
+      operation: task.operation === 'create' ? 'create' : 'modify',
+      dependencies: task.dependencies, authorized_files: [task.file_scope[0]!],
+      status: 'pending', proposal_validation: 'not_run', automated_checks: 'not_run', repair_attempts: 0,
+    }));
     await transition('plan_validated');
-    for (const task of tasks) await git(projectRoot, ['cat-file', '-e', `HEAD:${task.file_scope[0]}`]);
+    for (const task of tasks) {
+      if (task.operation === 'modify_existing') await git(projectRoot, ['cat-file', '-e', `HEAD:${task.file_scope[0]}`]);
+    }
     if (options.dryRun) {
       await transition('awaiting_human_review', 'Multi-task dry run completed without local generation or execution.');
       return await finish();
@@ -240,22 +311,55 @@ export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOpti
 
     const processedFiles: string[] = [];
     const expectedHashes = new Map<string, string>();
+    const tasksById = new Map(tasks.map(task => [task.task_id, task]));
+    const resultById = new Map(report.task_results!.map(result => [result.task_id, result]));
+    const blockRemaining = (failedIndex: number, failedTaskId: string): void => {
+      for (let remainingIndex = failedIndex + 1; remainingIndex < tasks.length; remainingIndex += 1) {
+        const remainingTask = tasks[remainingIndex]!;
+        const remainingResult = report.task_results![remainingIndex]!;
+        const unsatisfied = remainingTask.dependencies.filter(dependency => resultById.get(dependency)?.status !== 'passed');
+        remainingResult.status = unsatisfied.length > 0 ? 'blocked_by_dependency' : 'blocked_by_policy';
+        remainingResult.completed_at = new Date().toISOString();
+        remainingResult.blocked_reason = unsatisfied.length > 0
+          ? `Prerequisites did not pass: ${unsatisfied.join(', ')}.`
+          : `Execution stopped after task ${failedTaskId} failed; partial feature execution is not eligible for integration.`;
+      }
+    };
     for (const [index, task] of tasks.entries()) {
       const file = task.file_scope[0]!;
-      await transition('local_generating', `Generating task ${index + 1}/${tasks.length}: ${task.task_id}`);
+      const result = report.task_results![index]!;
+      const unsatisfied = task.dependencies.filter(dependency => resultById.get(dependency)?.status !== 'passed');
+      if (unsatisfied.length > 0) {
+        result.status = 'blocked_by_dependency';
+        result.completed_at = new Date().toISOString();
+        result.blocked_reason = `Prerequisites did not pass: ${unsatisfied.join(', ')}.`;
+        await save();
+        continue;
+      }
+      result.status = 'ready';
+      await save();
+      result.status = 'running';
+      result.started_at = new Date().toISOString();
       let persistentProposal: string | undefined;
       try {
+        if (task.operation === 'create') {
+          if (await lstat(resolve(worktreePath, file)).then(() => true, () => false)) throw new Error(`Creation destination unexpectedly exists: ${file}.`);
+          result.expected_absent_before = true;
+        } else {
+          result.source_sha256_before = hash(await readFile(resolve(worktreePath, file)));
+        }
+        await transition('local_generating', `Generating task ${index + 1}/${tasks.length}: ${task.task_id}`);
         const worktreeProposal = await proposeLocalChange({
-          project: worktreePath, file, task: boundedInstruction(request, task), model: localModel,
+          project: worktreePath, file, operation: task.operation === 'create' ? 'create' : 'modify',
+          task: await boundedInstruction(request, task, tasksById, worktreePath), model: localModel,
           ...(options.proposalAdapter ? { adapter: options.proposalAdapter } : {}),
         });
         const proposalDirectory = await ensureProposalDirectory(projectRoot);
         persistentProposal = resolve(proposalDirectory, `${runId}-${index + 1}-${task.task_id}.json`);
         await writeFile(persistentProposal, await readFile(worktreeProposal), { flag: 'wx', mode: 0o600 });
-        report.task_results!.push({
-          task_id: task.task_id, file, order: index + 1, status: 'failed', proposal_validation: 'passed',
-          automated_checks: 'skipped', repair_attempts: 0, proposal_path: persistentProposal,
-        });
+        result.proposal_path = persistentProposal;
+        result.proposal_validation = 'passed';
+        result.automated_checks = 'skipped';
         report.validation.proposal = 'passed';
         await transition('proposal_validated', `Validated task ${task.task_id}.`);
         await transition('executing', `Applying task ${task.task_id} in the shared worktree.`);
@@ -267,21 +371,26 @@ export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOpti
           deferChecks: options.taskCommands === undefined,
           onRepairStart: async () => transition('repairing', `Repairing task ${task.task_id}.`),
         });
-        const result = report.task_results!.at(-1)!;
         result.execution_report_path = taskReport.report_path;
         result.repair_attempts = taskReport.repair_attempts_used;
         result.automated_checks = taskReport.automated_checks;
         result.proposal_validation = taskReport.proposal_validity;
         if (taskReport.status !== 'passed') {
           if (taskReport.proposal_validity !== 'passed') report.validation.proposal = 'failed';
+          result.status = 'failed';
+          result.completed_at = new Date().toISOString();
           result.error = taskReport.errors.join('; ');
+          blockRemaining(index, task.task_id);
           preserve();
           await saveCombinedArtifacts(tasks.slice(0, index + 1), [], 'failed', taskReport.errors);
           return await fail(`Task ${task.task_id} failed: ${taskReport.errors.join('; ')}`);
         }
         result.status = 'passed';
+        result.completed_at = new Date().toISOString();
         processedFiles.push(file);
-        expectedHashes.set(file, hash(await readFile(resolve(worktreePath, file))));
+        const resultingHash = hash(await readFile(resolve(worktreePath, file)));
+        result.source_sha256_after = resultingHash;
+        expectedHashes.set(file, resultingHash);
         const modified = statusFiles(await git(worktreePath, ['status', '--porcelain=v1', '-z', '--untracked-files=all']));
         if (modified.some(path => !processedFiles.includes(path))) throw new Error(`Task ${task.task_id} modified an unauthorized file.`);
         for (const previous of processedFiles) {
@@ -292,17 +401,23 @@ export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOpti
         await rm(worktreeProposal, { force: true });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        const existing = report.task_results?.find(result => result.task_id === task.task_id);
-        if (existing) { existing.proposal_validation = 'failed'; existing.error = sanitizeCloudText(message, 4_000); }
-        else report.task_results!.push({
-          task_id: task.task_id, file, order: index + 1, status: 'failed', proposal_validation: 'failed',
-          automated_checks: 'skipped', repair_attempts: 0, ...(persistentProposal ? { proposal_path: persistentProposal } : {}), error: sanitizeCloudText(message, 4_000),
-        });
+        result.status = 'failed';
+        result.completed_at = new Date().toISOString();
+        result.proposal_validation = 'failed';
+        result.automated_checks = result.automated_checks === 'not_run' ? 'skipped' : result.automated_checks;
+        result.error = sanitizeCloudText(message, 4_000);
+        if (persistentProposal) result.proposal_path = persistentProposal;
+        blockRemaining(index, task.task_id);
         report.validation.proposal = 'failed';
         preserve();
         await saveCombinedArtifacts(tasks.slice(0, Math.max(index, 1)), [], 'failed', [message]).catch(() => undefined);
         return await fail(`Task ${task.task_id} failed: ${message}`);
       }
+    }
+
+    if (report.task_results!.some(result => result.status !== 'passed')) {
+      preserve();
+      return await fail('Not all dependency-aware tasks completed successfully.');
     }
 
     const commands = options.commands ?? await loadTrustedCommands(projectRoot);
@@ -357,6 +472,7 @@ export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOpti
       report.failure_reason = sanitizeCloudText(`Cloud review unavailable: ${error instanceof Error ? error.message : String(error)}`, 4_000);
       await transition('awaiting_cloud_review', report.failure_reason);
     }
+    if (!finalPassed) return await fail(finalErrors.join(' '));
     if (options.keepWorktree || preserveWorktree) {
       preserve();
     } else {
@@ -369,7 +485,7 @@ export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOpti
     preserveWorktree = worktreeCreated;
     if (worktreeCreated) report.worktree = { location: worktreePath, preserved: true, cleaned: false };
     report.cloud_usage_path = await usage.save(projectRoot).catch(() => report.cloud_usage_path);
-    return fail(error instanceof Error ? error.message : String(error));
+    return fail(error instanceof Error ? error.message : String(error), error instanceof PlanValidationError ? 'blocked' : 'failed');
   } finally {
     if (worktreeCreated && !preserveWorktree && !options.keepWorktree) {
       await git(projectRoot, ['-c', `core.hooksPath=${disabledHooks}`, 'worktree', 'remove', '--force', worktreePath]).catch(() => undefined);

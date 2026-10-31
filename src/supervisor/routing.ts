@@ -2,6 +2,8 @@ import { lstat, realpath } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { RepositoryInventory } from './inventory.js';
 import { implementationPlanSchema, type ImplementationPlan, type PlanTask, type RoutingFinding } from './schemas.js';
+import { DependencyGraphError, orderTasksByDependencies } from './dependency-graph.js';
+import { resolveSafeCreationPath } from '../proposal-validation.js';
 
 const HIGH_RISK_TAGS = new Set([
   'security', 'authentication', 'authorization', 'billing', 'migration',
@@ -18,41 +20,6 @@ export class PlanValidationError extends Error {
   constructor(readonly reasons: string[]) {
     super(`Invalid supervisor plan: ${reasons.join('; ')}`);
   }
-}
-
-function dependencyErrors(tasks: PlanTask[]): string[] {
-  const errors: string[] = [];
-  const positions = new Map<string, number>();
-  tasks.forEach((task, index) => {
-    if (positions.has(task.task_id)) errors.push(`Duplicate task ID: ${task.task_id}`);
-    positions.set(task.task_id, index);
-  });
-  for (const [index, task] of tasks.entries()) {
-    for (const dependency of task.dependencies) {
-      const position = positions.get(dependency);
-      if (position === undefined) errors.push(`Task ${task.task_id} has unknown dependency ${dependency}.`);
-      else if (position >= index) errors.push(`Task ${task.task_id} is not ordered after dependency ${dependency}.`);
-    }
-  }
-
-  const visiting = new Set<string>();
-  const visited = new Set<string>();
-  const byId = new Map(tasks.map(task => [task.task_id, task]));
-  const visit = (id: string): void => {
-    if (visiting.has(id)) {
-      errors.push(`Circular dependency detected at task ${id}.`);
-      return;
-    }
-    if (visited.has(id)) return;
-    visiting.add(id);
-    for (const dependency of byId.get(id)?.dependencies ?? []) {
-      if (byId.has(dependency)) visit(dependency);
-    }
-    visiting.delete(id);
-    visited.add(id);
-  };
-  for (const task of tasks) visit(task.task_id);
-  return [...new Set(errors)];
 }
 
 function safeScope(path: string): boolean {
@@ -89,10 +56,16 @@ async function routeTask(task: PlanTask, projectRoot?: string): Promise<RoutingF
   if (highRisk) reasons.push('High-risk domain requires cloud or human handling.');
   if (task.complexity === 'complex') reasons.push('Complex tasks are outside the current local-worker boundary.');
   if (task.file_scope.length !== 1) reasons.push('The local worker supports exactly one file per task.');
-  if (task.operation !== 'modify_existing') reasons.push('The local worker cannot create or delete files.');
+  if (task.operation === 'delete') reasons.push('The local worker cannot delete files.');
   if (task.file_scope.some(path => !safeScope(path))) reasons.push('File scope contains a protected or unsafe path.');
   if (task.operation === 'modify_existing' && task.file_scope.length === 1 && !await existingSafeFile(projectRoot, task.file_scope[0]!)) {
     reasons.push('The scoped file is not an existing safe regular file in the target repository.');
+  }
+  if (task.operation === 'create' && (task.risk !== 'low' || task.complexity === 'complex')) reasons.push('New-file creation requires a low-risk, bounded task.');
+  if (task.operation === 'create' && task.file_scope.length === 1 && projectRoot) {
+    await resolveSafeCreationPath(projectRoot, task.file_scope[0]!).catch(error => {
+      reasons.push(`Creation target is not authorized: ${error instanceof Error ? error.message : String(error)}`);
+    });
   }
   if (task.complexity === 'moderate' && (task.acceptance_criteria.length < 2 || task.validation_requirements.length < 1)) {
     reasons.push('Moderate local work requires at least two acceptance criteria and explicit validation.');
@@ -117,7 +90,14 @@ export async function validateAndEnforcePlan(
   const parsed = implementationPlanSchema.safeParse(input);
   if (!parsed.success) throw new PlanValidationError(parsed.error.issues.map(issue => `${issue.path.join('.') || 'plan'}: ${issue.message}`));
   const plan = parsed.data;
-  const errors = dependencyErrors(plan.tasks);
+  let orderedTasks: PlanTask[];
+  try {
+    orderedTasks = orderTasksByDependencies(plan.tasks);
+  } catch (error) {
+    if (error instanceof DependencyGraphError) throw new PlanValidationError(error.reasons);
+    throw error;
+  }
+  const errors: string[] = [];
   if (plan.tasks.length > (options.maxTasks ?? 8)) errors.push(`Plan exceeds the maximum of ${options.maxTasks ?? 8} tasks.`);
   const selectablePaths = options.inventory ? new Set(options.inventory.files.map(file => file.path)) : undefined;
   for (const task of plan.tasks) {
@@ -135,9 +115,9 @@ export async function validateAndEnforcePlan(
   if (errors.length > 0) throw new PlanValidationError(errors);
 
   const projectRoot = options.projectRoot ? await realpath(options.projectRoot) : undefined;
-  const findings = await Promise.all(plan.tasks.map(task => routeTask(task, projectRoot)));
+  const findings = await Promise.all(orderedTasks.map(task => routeTask(task, projectRoot)));
   const findingByTask = new Map(findings.map(finding => [finding.task_id, finding]));
-  const tasks = plan.tasks.map(task => {
+  const tasks = orderedTasks.map(task => {
     const finding = findingByTask.get(task.task_id)!;
     if (task.recommended_executor === finding.enforced_executor) return task;
     return {

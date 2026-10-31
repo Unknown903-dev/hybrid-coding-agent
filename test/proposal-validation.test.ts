@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { rm } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { generateDiff, validateProposal } from '../src/proposal-validation.js';
 
 const temporaryDirectories: string[] = [];
@@ -38,6 +39,13 @@ async function writeProposal(root: string, value: unknown, name = 'proposal.json
   const path = join(root, '.agent-proposals', name);
   await writeFile(path, typeof value === 'string' ? value : JSON.stringify(value));
   return path;
+}
+
+function creation(file = 'src/new-helper.ts', content = 'export const helper = true;\n'): Record<string, unknown> {
+  return proposal({
+    operation: 'create', file, proposed_content: content, original_sha256: undefined,
+    expected_absent: true, resulting_sha256: createHash('sha256').update(content).digest('hex'),
+  });
 }
 
 describe('validateProposal', () => {
@@ -129,6 +137,52 @@ describe('validateProposal', () => {
 
     expect(report.valid).toBe(false);
     expect(report.errors.join(' ')).toContain('protected');
+  });
+
+  it('validates a new-file proposal without creating the destination', async () => {
+    const root = await repository();
+    const path = await writeProposal(root, creation());
+    const report = await validateProposal({ project: root, proposalPath: path });
+    expect(report.valid).toBe(true);
+    expect(report.proposal?.operation).toBe('create');
+    expect(report.originalSha256).toBeUndefined();
+    expect(report.diff?.addedLines).toBeGreaterThan(0);
+    await expect(readFile(join(root, 'src', 'new-helper.ts'))).rejects.toThrow();
+  });
+
+  it('rejects existing, missing-parent, unsupported, protected, and case-colliding creation paths', async () => {
+    const root = await repository();
+    await writeFile(join(root, 'src', 'Collision.ts'), 'export {};\n');
+    const values = [
+      creation('src/example.ts'), creation('missing/new.ts'), creation('src/new.exe'),
+      creation('.agent-state/new.ts'), creation('src/collision.ts'),
+    ];
+    for (const [index, value] of values.entries()) {
+      const report = await validateProposal({ project: root, proposalPath: await writeProposal(root, value, `create-${index}.json`) });
+      expect(report.valid).toBe(false);
+    }
+  });
+
+  it('rejects traversal and symlinked parents for creation', async () => {
+    const root = await repository();
+    const outside = await mkdtemp(join(tmpdir(), 'create-parent-outside-'));
+    temporaryDirectories.push(outside);
+    await symlink(outside, join(root, 'linked-parent'));
+    const traversal = await validateProposal({ project: root, proposalPath: await writeProposal(root, creation('../escape.ts'), 'create-traversal.json') });
+    const linked = await validateProposal({ project: root, proposalPath: await writeProposal(root, creation('linked-parent/new.ts'), 'create-linked.json') });
+    expect(traversal.valid).toBe(false);
+    expect(linked.valid).toBe(false);
+  });
+
+  it('rejects create proposals with binary, oversized, or mismatched content hashes', async () => {
+    const root = await repository();
+    const binary = await validateProposal({ project: root, proposalPath: await writeProposal(root, creation('src/binary.ts', 'x\u0000y'), 'binary-create.json') });
+    const oversizedContent = 'x'.repeat(200_001);
+    const oversized = await validateProposal({ project: root, proposalPath: await writeProposal(root, creation('src/large.ts', oversizedContent), 'large-create.json') });
+    const mismatched = await validateProposal({ project: root, proposalPath: await writeProposal(root, { ...creation('src/hash.ts'), resulting_sha256: '0'.repeat(64) }, 'hash-create.json') });
+    expect(binary.valid).toBe(false);
+    expect(oversized.valid).toBe(false);
+    expect(mismatched.valid).toBe(false);
   });
 
   it('flags large diffs for review without rejecting them', async () => {

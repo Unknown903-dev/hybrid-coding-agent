@@ -1,5 +1,5 @@
-import { lstat, readFile, realpath } from 'node:fs/promises';
-import { isAbsolute, relative, resolve, sep, win32 } from 'node:path';
+import { lstat, readFile, readdir, realpath } from 'node:fs/promises';
+import { basename, dirname, extname, isAbsolute, relative, resolve, sep, win32 } from 'node:path';
 import { createTwoFilesPatch, diffLines } from 'diff';
 import { createHash } from 'node:crypto';
 import { formatSchemaIssues, proposalSchema, type Proposal } from './proposal-schema.js';
@@ -8,9 +8,13 @@ const MAX_PROPOSAL_BYTES = 1_000_000;
 const MAX_SOURCE_BYTES = 200_000;
 const PROTECTED_SEGMENTS = new Set([
   '.git', '.agent-proposals', '.agent-runs', '.agent-worktrees', '.agent-state', '.aws', '.codex', '.ssh', 'node_modules',
-  'dist', 'build', 'coverage',
+  '.github', '.gitlab', '.circleci', 'dist', 'build', 'coverage',
 ]);
 const PROTECTED_FILES = new Set(['.env', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
+const CREATABLE_EXTENSIONS = new Set([
+  '.c', '.cc', '.cpp', '.cs', '.css', '.go', '.h', '.hpp', '.html', '.java', '.js', '.jsx',
+  '.kt', '.mjs', '.php', '.py', '.rb', '.rs', '.swift', '.ts', '.tsx', '.vue',
+]);
 
 export interface DiffThresholds {
   changedLines: number;
@@ -175,6 +179,41 @@ export async function resolveSafeTargetPath(
   return { path: actualPath, relativePath };
 }
 
+export async function resolveSafeCreationPath(
+  projectRoot: string,
+  file: string,
+  extraProtectedPaths: string[] = [],
+): Promise<{ path: string; relativePath: string }> {
+  if (!file || isAbsolute(file) || win32.isAbsolute(file) || file.includes('\\') || /[\u0000-\u001f\u007f]/.test(file)) {
+    throw new Error('Creation path must be a clean repository-relative path.');
+  }
+  if (file.split('/').some(segment => !segment || segment === '.' || segment === '..')) throw new Error('Creation path contains traversal or empty segments.');
+  const lexicalPath = resolve(projectRoot, file);
+  if (isOutside(projectRoot, lexicalPath)) throw new Error('Creation path escapes the repository.');
+  const relativePath = relative(projectRoot, lexicalPath);
+  if (!relativePath || isProtected(relativePath, extraProtectedPaths)) throw new Error(`Creation path is protected: ${file}`);
+  if (!CREATABLE_EXTENSIONS.has(extname(relativePath).toLowerCase())) throw new Error(`Creation path uses an unsupported file extension: ${file}`);
+  const parent = dirname(lexicalPath);
+  const parentStat = await lstat(parent).catch(() => undefined);
+  if (!parentStat?.isDirectory() || parentStat.isSymbolicLink()) throw new Error('Creation requires an existing, non-symlink parent directory.');
+  const actualParent = await realpath(parent);
+  if (isOutside(projectRoot, actualParent) || resolve(projectRoot, relative(projectRoot, actualParent)) !== actualParent) {
+    throw new Error('Creation path has a symlinked or escaping ancestor directory.');
+  }
+  let cursor = actualParent;
+  while (cursor !== projectRoot) {
+    if (await lstat(resolve(cursor, '.git')).then(() => true, () => false)) throw new Error('Creation inside a Git submodule is unsupported.');
+    const next = dirname(cursor);
+    if (next === cursor || isOutside(projectRoot, next)) throw new Error('Creation parent escapes the repository.');
+    cursor = next;
+  }
+  if (await lstat(lexicalPath).then(() => true, () => false)) throw new Error(`Creation destination already exists: ${file}`);
+  const name = basename(lexicalPath);
+  const collision = (await readdir(actualParent)).find(entry => entry.toLowerCase() === name.toLowerCase() && entry !== name);
+  if (collision) throw new Error(`Creation path case-collides with existing entry ${collision}.`);
+  return { path: lexicalPath, relativePath: relativePath.split(sep).join('/') };
+}
+
 export async function validateProposal(options: ValidationOptions): Promise<ValidationReport> {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -239,7 +278,9 @@ export async function validateProposal(options: ValidationOptions): Promise<Vali
 
   let target: { path: string; relativePath: string };
   try {
-    target = await resolveSafeTargetPath(projectRoot, proposal.file, options.protectedPaths ?? []);
+    target = proposal.operation === 'create'
+      ? await resolveSafeCreationPath(projectRoot, proposal.file, options.protectedPaths ?? [])
+      : await resolveSafeTargetPath(projectRoot, proposal.file, options.protectedPaths ?? []);
   } catch (error) {
     errors.push(error instanceof Error ? error.message : String(error));
     return {
@@ -255,10 +296,11 @@ export async function validateProposal(options: ValidationOptions): Promise<Vali
 
   if (proposal.proposed_content.trim().length === 0) errors.push('Proposed content is empty or whitespace-only.');
   if (proposal.proposed_content.includes('\u0000')) errors.push('Proposed content contains binary NUL bytes.');
+  if (Buffer.byteLength(proposal.proposed_content, 'utf8') > MAX_SOURCE_BYTES) errors.push(`Proposed content exceeds ${MAX_SOURCE_BYTES} bytes.`);
 
-  const original = await readFile(target.path, 'utf8');
-  if (original.includes('\u0000')) errors.push('Target file appears to be binary.');
-  if (proposal.proposed_content === original) errors.push('Proposal is unchanged from the target file.');
+  const original = proposal.operation === 'create' ? '' : await readFile(target.path, 'utf8');
+  if (proposal.operation === 'modify' && original.includes('\u0000')) errors.push('Target file appears to be binary.');
+  if (proposal.operation === 'modify' && proposal.proposed_content === original) errors.push('Proposal is unchanged from the target file.');
 
   const diff = errors.length === 0
     ? generateDiff(target.relativePath.split(sep).join('/'), original, proposal.proposed_content, options.thresholds)
@@ -273,7 +315,7 @@ export async function validateProposal(options: ValidationOptions): Promise<Vali
     proposalPath,
     projectRoot,
     targetPath: target.path,
-    originalSha256: createHash('sha256').update(original).digest('hex'),
+    ...(proposal.operation === 'modify' ? { originalSha256: createHash('sha256').update(original).digest('hex') } : {}),
     proposal,
     diff,
     requiresManualReview: errors.length === 0 && (diff?.suspicious ?? false),

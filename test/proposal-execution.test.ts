@@ -53,6 +53,15 @@ async function proposal(root: string, overrides: Record<string, unknown> = {}): 
   return path;
 }
 
+async function creationProposal(root: string): Promise<string> {
+  const content = 'export const created = true;\n';
+  return proposal(root, {
+    operation: 'create', file: 'src/created.ts', proposed_content: content,
+    original_sha256: undefined, expected_absent: true,
+    resulting_sha256: createHash('sha256').update(content).digest('hex'),
+  });
+}
+
 function command(name: string, source: string, timeoutMs = 2_000): TrustedCommand {
   return {
     name,
@@ -68,6 +77,17 @@ async function doesNotExist(path: string): Promise<boolean> {
 }
 
 describe('executeProposal', () => {
+  it('creates one authorized file only inside the isolated worktree', async () => {
+    const root = await repository();
+    const path = await creationProposal(root);
+    const report = await executeProposal({
+      project: root, proposalPath: path, apply: true,
+      commands: [command('created-check', "const fs=require('fs');process.exit(fs.readFileSync('src/created.ts','utf8').includes('created')?0:1)")],
+    });
+    expect(report.status).toBe('passed');
+    expect(await doesNotExist(join(root, 'src', 'created.ts'))).toBe(true);
+    expect(await git(root, ['status', '--porcelain', '--untracked-files=all'])).toBe('');
+  });
   it('supports the execute CLI with explicit apply authorization', async () => {
     const root = await repository();
     const path = await proposal(root);

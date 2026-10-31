@@ -1,6 +1,6 @@
-# Hybrid Coding Agent — Milestone 6C.2
+# Hybrid Coding Agent — Milestone 6E
 
-This project connects a **read-only Cloud Codex supervisor**, a direct **local Ollama proposal/repair worker**, and a **TypeScript policy and execution orchestrator**. Milestone 6A provides one explicitly authorized end-to-end command for a single eligible existing-file task; Milestone 6B adds explicit human approval and controlled application of the exact reviewed patch; Milestone 6C.1 adds sequential execution of two to five independent existing-file tasks in one isolated worktree; and Milestone 6C.2 extends the same signed approval and transactional integration path to their combined patches. It does not execute dependent tasks, run tasks in parallel, commit, push, merge, deploy, or perform cloud coding.
+This project connects a **read-only Cloud Codex supervisor**, a direct **local Ollama proposal/repair worker**, and a **TypeScript policy and execution orchestrator**. Milestone 6E extends the dependency-aware, signed workflow to explicitly authorized new source and test files mixed with existing-file modifications. It does not delete or rename files, run tasks in parallel, commit, push, merge, deploy, or perform cloud coding.
 
 ## Prerequisites
 
@@ -45,9 +45,9 @@ The `run` command performs one bounded lifecycle:
 
 1. Verifies the Git repository has a `HEAD` commit and no tracked index or working-tree changes.
 2. Uses the shared Cloud Codex call budget to obtain and validate a grounded plan.
-3. Requires exactly one deterministically local-eligible task targeting one existing file tracked at `HEAD`.
-4. Sends a bounded task and that authorized file to Ollama's direct HTTP API.
-5. Validates the strict proposal schema, target path, and SHA-256 source digest.
+3. Requires exactly one deterministically local-eligible task that modifies an existing tracked file or creates one authorized source/test file.
+4. Sends the bounded task, declared operation, and only its authorized file context to Ollama's direct HTTP API.
+5. Validates the strict proposal schema and either the original SHA-256 source digest or the new path's expected-absence precondition.
 6. Applies the proposal in one owned detached worktree, runs trusted checks, and requests bounded local repair only after a failed check.
 7. Saves the final patch and repair report before worktree cleanup.
 8. Uses the same cloud budget for a read-only supervisor review, then stops for human review.
@@ -68,22 +68,26 @@ Normal execution requires both `--allow-cloud` and `--apply`. A non-dry run with
 ```sh
 npm run dev -- run \
   --project /absolute/path/to/disposable-repository \
-  --task "Update these independent utilities" \
+  --task "Update the utility, its consumer, and related tests" \
   --multi-task \
   --max-tasks 3 \
   --allow-cloud \
   --apply
 ```
 
-Multi-task mode accepts two through five independent tasks. Every task must be deterministically local-eligible, modify exactly one different verified existing file, have no dependencies, and remain outside protected or high-risk domains. The entire plan is rejected before Ollama or worktree execution if any task is unsupported; the orchestrator never silently executes a subset.
+Multi-task mode accepts two through five dependent or independent tasks. Every task must be deterministically local-eligible and explicitly classify its one-file operation as modifying an existing file or creating a new file. Task IDs and target paths must be unique; dependencies must be unique, refer to plan tasks, and cannot be self-referential or cyclic. The host performs a deterministic topological sort, using task ID order whenever multiple tasks are ready. The entire plan is rejected before Ollama or worktree execution if the graph or any task is unsupported; the orchestrator never silently executes a subset.
 
-The coordinator acquires all per-file locks in stable order and creates one detached owned worktree. Tasks execute in plan order, so later applications and trusted checks observe earlier worktree changes. Each proposal is generated from the current authorized file, validated against its current SHA-256 digest, and applied through the existing bounded repair coordinator. Model output cannot add files or commands.
+Creation is restricted to absent paths under already-existing, non-symlink repository directories. Allowed extensions are `.c`, `.cc`, `.cpp`, `.cs`, `.css`, `.go`, `.h`, `.hpp`, `.html`, `.java`, `.js`, `.jsx`, `.kt`, `.mjs`, `.php`, `.py`, `.rb`, `.rs`, `.swift`, `.ts`, `.tsx`, and `.vue`. Protected agent/Git/credential/build paths, submodules, case-collisions, missing parents, configuration/workflow types, binary content, oversized content, and executable modes are rejected. Directories are never created in the target repository as part of a task.
 
-Conventional repository-wide validation commands are not assumed safe as per-task checks because a temporarily incomplete multi-task plan may fail them. The CLI therefore defers those checks and repairs until all task proposals have been applied, then runs the complete trusted validation suite once. The programmatic coordinator accepts explicitly scoped `taskCommands`; when supplied, failed task checks may invoke the existing bounded local repair loop. A final combined-check failure never triggers speculative cross-file repair and preserves the shared worktree for inspection.
+The coordinator acquires all per-file locks in stable order and creates one detached owned worktree. A task starts only after all declared prerequisites pass, so a created file is available to authorized dependent tasks. Modify proposals bind the current worktree-relative SHA-256; create proposals bind expected absence and their resulting SHA-256. Creation uses exclusive writes with mode `0644`. Model output cannot select another path, create directories, add commands, or change the authorized operation.
 
-One combined Git diff, one combined execution report, and one final Cloud supervisor review are produced. Planning and final review share the normal two-call default budget; there is no per-task cloud review or cloud coding fallback. Reports record execution order, task/file scopes, proposal and report references, per-task repair/check outcomes, combined checks, patch SHA-256, Cloud usage/review, worktree cleanup state, and human-approval availability.
+For a dependent task, Ollama receives its target file plus read-only excerpts from its **direct** prerequisite files in the shared worktree. These files come only from validated task scopes, are rechecked as regular in-worktree files, and are bounded to 8 KB per file and 20 KB total before prompt sanitization. Transitive dependencies and the rest of the repository are not automatically disclosed. Dependency source is untrusted context and never expands the task's write scope. Repeated file targets remain unsupported in this milestone: the plan is blocked rather than risking an overwrite of an earlier task.
 
-Combined patches covering two to five authorized files use the same `run inspect`, `run approve`, and `run integrate` workflow as single-file runs. Approval becomes eligible only after all task outcomes and final trusted checks pass and the Cloud review verdict is `ready_for_human_review`. File creation, deletion, rename, copy, binary, mode-changing, and submodule patches remain unsupported.
+Conventional repository-wide validation commands are not assumed safe as per-task checks because a temporarily incomplete dependency chain may fail them. The CLI therefore defers those checks and repairs until all task proposals have been applied, then runs the complete trusted validation suite once. The programmatic coordinator accepts explicitly scoped `taskCommands`; when supplied, failed task checks may invoke the existing bounded local repair loop. A failed prerequisite marks downstream tasks `blocked_by_dependency`; remaining unrelated work is explicitly `blocked_by_policy` under the fail-fast policy. No partial run is approval-eligible. A final combined-check failure never triggers speculative cross-file repair, marks the overall run failed, and preserves the shared worktree for inspection.
+
+One combined Git diff, one combined execution report, and one final Cloud supervisor review are produced. Planning and final review share the normal two-call default budget; there is no per-task cloud review or cloud coding fallback. Reports preserve declared dependencies and computed execution order, and track each task's authorized scope, pending/ready/running/final state, timestamps, source hashes, proposal/report references, repair/check outcomes, and block reason. A task passing does not establish that combined validation or the feature passed.
+
+Combined patches covering two to five authorized files use the same `run inspect`, `run approve`, and `run integrate` workflow as modification-only runs. Untracked authorized files are emitted as real Git `new file mode 100644` patches without staging the original index. Approval becomes eligible only after all task outcomes and final trusted checks pass and the Cloud review verdict is `ready_for_human_review`. Deletion, rename, copy, binary, executable/mode-changing, and submodule patches remain unsupported.
 
 ### Orchestration reports and recovery
 
@@ -112,7 +116,7 @@ Approval requires either typing `approve` at an interactive terminal or passing 
 npm run dev -- run approve --project /path/to/repository --run-id <run-id> --yes
 ```
 
-Approval requires passing trusted checks and a `ready_for_human_review` review artifact. It revalidates the run, execution/validation report, review, protected paths, every original source digest, exact changed-file set, and patch applicability. Its HMAC-signed record binds the exact combined patch hash, sorted file list, repository identity, `HEAD`, every source digest, artifact hashes, timestamp, and authorization method under `.agent-state/approvals/`. Approval neither modifies nor stages source and remains a human decision—not proof of correctness. Older signed single-file records remain accepted by the same path.
+Approval requires passing trusted checks and a `ready_for_human_review` review artifact. It revalidates the run, operation map, execution/validation report, review, protected paths, existing source digests, creation absence, exact changed-file set, and patch applicability. Its HMAC-signed record binds the exact combined patch, sorted file list, per-file operation, original hashes, expected-absence paths, every materialized result hash, repository identity, `HEAD`, artifact hashes, timestamp, and authorization method. Approval neither modifies nor stages source. Older modification-only signed records remain accepted.
 
 Apply that exact approved patch to the original working tree with:
 
@@ -120,9 +124,9 @@ Apply that exact approved patch to the original working tree with:
 npm run dev -- run integrate --project /path/to/repository --run-id <run-id>
 ```
 
-Integration verifies the signed approval, artifact hashes, patch hash, repository identity, unchanged `HEAD`, clean tracked working tree/index, every unchanged target digest, protected-path policy, exact one-to-five-file scope, and `git apply --check`. It acquires all per-target locks in sorted order to prevent overlapping integrations without deadlock, then revalidates the run and repository state. A private verified patch copy closes the ordinary artifact replacement window. Application uses no shell interpolation and must produce exactly the approved changed-file set and byte-for-byte Git diff. Changes remain unstaged; integration creates no commit and performs no merge, push, or deployment.
+Integration verifies the signed approval, artifact hashes, operation map, patch hash, repository identity, unchanged `HEAD`, clean working tree/index, existing source hashes, absent creation destinations, protected-path policy, exact scope, and `git apply --check`. It acquires locks in sorted order and revalidates state. Existing-file hunks use the private verified patch; new files use exclusive `wx` creation from content materialized from that exact patch. Every result hash and the reconstructed combined Git diff must match approval. All changes remain unstaged.
 
-Every authorized source file is buffered before application. If application or post-application verification fails, the coordinator restores all verified snapshots and any unexpected tracked change, then verifies source digests and a clean working tree. A rollback that cannot be verified is reported as `manual_recovery_required` with affected paths; it is never reported as success. Successful and failed audit records are atomically written and separately HMAC-signed under `.agent-state/integrations/`. They include original/resulting source hashes, `HEAD`, timestamps, rollback state, and explicit false commit/push/merge/deployment flags. A successful run cannot be integrated twice.
+Modified files are buffered before application. On handled failure they are restored; created files are removed only when they remain regular files whose content hash still matches this integration. Independently changed destinations are preserved and reported as `manual_recovery_required`. Rollback never recursively removes directories or silently overwrites unrelated content. Signed audits include operations, original/result hashes, `HEAD`, timestamps, rollback state, and explicit false commit/push/merge/deployment flags.
 
 This is handled-failure atomicity, not durable crash consistency. Process termination, machine failure, filesystem faults, or an external process that ignores the orchestrator's locks can interrupt application or rollback. Inspect `git status`, `git diff`, and the signed audit records before recovery; do not retry blindly when manual recovery is reported. User-created worktrees are not removed.
 
@@ -148,7 +152,7 @@ Create a disposable Git repository with an initial commit, one existing source f
 ## Next milestones
 
 1. Durable crash-recovery journaling for patch integration.
-2. Dependent-task scheduling, parallel execution, and separately authorized remote integration.
+2. Parallel execution and separately authorized remote integration.
 
 ## Security
 
@@ -312,18 +316,18 @@ npm run dev -- supervisor plan \
 
 Before any planning request, the orchestrator obtains tracked and non-ignored untracked paths with `git ls-files`, then verifies every candidate with `lstat` and `realpath`. Symlinks, escaping paths, protected/secret paths, oversized files, and non-regular files are excluded. The resulting inventory and bounded, redacted source excerpts are included as untrusted planning context. File count, path characters, per-file content, total content, and individual file size all have hard limits; large repositories therefore produce a deliberately truncated inventory.
 
-The cloud response must match a strict versioned Zod schema. Tasks include IDs, ordered dependencies, operation type, explicit relative file scope, acceptance criteria, risk, complexity, proposed executor, routing explanation, and validation requirements. Unknown or circular dependencies and out-of-order plans are rejected. Plans also record whether repository context was sufficient. When the relevant file is not in the selectable inventory, the supervisor must return `context_status: "insufficient"` with no implementation tasks instead of inventing a path.
+The cloud response must match a strict versioned Zod schema. Tasks include IDs, dependencies, operation type, explicit relative file scope, acceptance criteria, risk, complexity, proposed executor, routing explanation, and validation requirements. Unknown, duplicate, self, or circular dependencies are rejected; valid tasks are deterministically topologically sorted. Plans also record whether repository context was sufficient. Missing paths for modification require insufficient context, while explicit creation paths go through the separate host-enforced creation policy.
 
 Cloud routing recommendations are advisory. A deterministic policy overrides them when necessary:
 
-- only simple low-risk, one-existing-file modifications are directly local-eligible;
+- simple low-risk one-file modifications and authorized new source/test files are directly local-eligible;
 - bounded moderate work needs one file, at least two acceptance criteria, and explicit validation;
-- complex, multi-file, create/delete, protected-path, or missing-file tasks route to cloud/human handling;
+- complex, per-task multi-file, delete, protected-path, unsafe-creation, or missing-modification tasks route to cloud/human handling;
 - security, authentication, authorization, billing, migration, deployment, infrastructure, public-API, production, credential, and data-loss work routes to cloud/human handling.
 
-For `modify_existing` and `delete`, every model-selected path must exactly match a path in the verified inventory. Absolute paths, traversal, protected paths, symlink escapes, and nonexistent or inventory-truncated paths are rejected; the orchestrator never rewrites a bad path to a guessed alternative. Genuine `create` tasks may name a new safe relative path, but deterministic routing marks them ineligible for the current local worker and keeps them for cloud/human handling only.
+For `modify_existing` and `delete`, every model-selected path must exactly match a path in the verified inventory. Absolute paths, traversal, protected paths, symlink escapes, and nonexistent or inventory-truncated modification paths are rejected; the orchestrator never rewrites a bad path. Genuine `create` tasks may name one new safe source/test path under an existing directory and are locally eligible only after deterministic absence, parent, extension, case-collision, submodule, and protected-path checks.
 
-The current local worker still supports exactly one existing safe regular file per task.
+The local worker supports exactly one authorized existing or new text file per task.
 
 The legacy `plan` command remains as an alias for structured supervisor planning, but now requires the same `--allow-cloud` authorization.
 
@@ -371,18 +375,19 @@ Cloud-hosted inference may consume OpenAI-hosted usage and requires Codex authen
 - Formatting-only detection compares non-whitespace content and is intentionally heuristic.
 - Diff size is a review signal; task-to-diff relevance still requires a human or supervisor.
 - The validator does not run model-proposed commands, compilers, linters, or tests.
-- Individual local proposals still target one existing file; multi-task orchestration combines two to five such bounded proposals before review.
-- Each proposal targets one existing regular file; file creation, deletion, and multi-file proposals are not supported.
+- Individual local proposals target exactly one authorized existing or new file; multi-task orchestration combines two to five bounded proposals before review.
 - A process crash may leave an owned worktree or lock for manual inspection; the executor never prunes unknown worktrees or guesses that another process is dead.
 - Supervisor planning and review remain read-only. The explicitly authorized `run` workflow coordinates one local task but never performs cloud takeover, merging, or deployment.
 - The bounded inventory is intentionally incomplete in very large repositories. If the needed file is omitted, planning reports insufficient context rather than searching outside the allowed context or guessing a path.
 - Source redaction is best effort. The inventory excludes conventional secret locations and credential file types, but repositories should not contain secrets under misleading ordinary source-file names.
-- Default single-task mode still supports exactly one dependency-free existing-file task; create/delete work remains blocked.
-- Sequential multi-task mode supports two to five dependency-free tasks on distinct existing files. Dependencies, overlapping scopes, partial-plan execution, and parallelism are rejected.
+- Default single-task orchestration, proposal execution, and multi-task orchestration support authorized creation. Deletion remains blocked.
+- Sequential multi-task mode supports a validated acyclic graph of two to five tasks on distinct existing files. Repeated file targets, partial-plan integration, and parallel execution are rejected.
+- Dependency context is bounded and limited to direct prerequisite files, but source redaction remains best effort; do not store secrets in ordinary source files.
 - A Cloud review verdict is advisory. It never starts another repair loop, cloud coding task, merge, commit, push, or deployment.
-- Approval/integration supports one to five existing text files. Binary, submodule, mode-changing, rename, copy, creation, and deletion patches are rejected.
+- Approval/integration supports one to five existing or newly created text files. Binary, submodule, executable/mode-changing, rename, copy, and deletion patches are rejected.
 - Integration intentionally leaves every approved change unstaged in the original working tree for manual review and commit.
 - Git patch application plus verified in-process restoration prevents partial-file results during handled failures. It cannot guarantee atomicity across an uncatchable process termination, machine failure, filesystem failure, or concurrent external writer outside the locking protocol; inspect `git status`, `git diff`, and `.agent-state/integrations/` before recovery.
+- Creation revalidates real parent paths and uses exclusive destination creation, but Node's path-based APIs do not provide portable descriptor-relative `openat` traversal; a privileged or noncooperating process racing ancestor replacement remains outside the guarantee.
 
 Run project checks with:
 

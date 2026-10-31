@@ -1,11 +1,13 @@
 import { execFile } from 'node:child_process';
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import { acquireExecutionLock, EXECUTION_PROTECTED_PATHS, releaseExecutionLock } from '../proposal-execution.js';
-import { resolveSafeTargetPath, validateProposal } from '../proposal-validation.js';
+import { resolveSafeCreationPath, resolveSafeTargetPath, validateProposal } from '../proposal-validation.js';
 import { readRunArtifact, sanitizeCloudText } from '../supervisor/artifacts.js';
+import { orderTasksByDependencies } from '../supervisor/dependency-graph.js';
 import { supervisorReviewSchema, type SupervisorReview } from '../supervisor/schemas.js';
 import { approvalRecordSchema, integrationAuditSchema, type ApprovalRecord, type IntegrationAudit } from './integration-schemas.js';
 import { orchestrationReportSchema, type OrchestrationReport } from './schemas.js';
@@ -35,14 +37,17 @@ interface RunBundle {
   reviewBytes?: Buffer;
   review?: SupervisorReview;
   files: string[];
+  operations: Record<string, 'modify' | 'create'>;
   originalSha256: Record<string, string>;
+  resultingSha256: Record<string, string>;
+  resultingContent: Record<string, string>;
 }
 
 export interface RunInspection {
   runId: string;
   task: string;
   changedFiles: string[];
-  selectedTasks: Array<{ taskId: string; file: string }>;
+  selectedTasks: Array<{ taskId: string; file: string; operation: 'modify' | 'create'; dependencies: string[] }>;
   executionOrder: string[];
   taskOutcomes: NonNullable<OrchestrationReport['task_results']>;
   finalValidation?: OrchestrationReport['combined_checks'];
@@ -147,10 +152,10 @@ function parseJson<T>(bytes: Buffer, label: string, parse: (value: unknown) => T
   }
 }
 
-function patchFiles(patch: string, expectedFiles: string[]): string[] {
-  if (/^(?:new file mode|deleted file mode|old mode|new mode|rename (?:from|to)|copy (?:from|to)|GIT binary patch|Binary files )/m.test(patch) ||
-      /^--- \/dev\/null$|^\+\+\+ \/dev\/null$|^Subproject commit |^index [a-f0-9.]+ 160000$/m.test(patch)) {
-    throw new Error('Patch contains unsupported creation, deletion, rename, copy, binary, mode-changing, or submodule operations.');
+function patchFiles(patch: string, expectedFiles: string[], operations: Record<string, 'modify' | 'create'>): string[] {
+  if (/^(?:deleted file mode|old mode|new mode|rename (?:from|to)|copy (?:from|to)|GIT binary patch|Binary files )/m.test(patch) ||
+      /^\+\+\+ \/dev\/null$|^Subproject commit |^index [a-f0-9.]+ 160000$/m.test(patch)) {
+    throw new Error('Patch contains unsupported deletion, rename, copy, binary, mode-changing, or submodule operations.');
   }
   const headers = [...patch.matchAll(/^diff --git a\/(.+) b\/(.+)$/gm)];
   if (headers.length !== expectedFiles.length) throw new Error('Patch scope does not match the authorized files.');
@@ -160,8 +165,16 @@ function patchFiles(patch: string, expectedFiles: string[]): string[] {
       throw new Error('Patch scope does not exactly match the authorized files.');
     }
     actual.add(header[1]);
-    if (!patch.includes(`--- a/${header[1]}\n`) || !patch.includes(`+++ b/${header[1]}\n`)) {
-      throw new Error('Patch has malformed or inconsistent file headers.');
+    const start = header.index!;
+    const next = headers.find(candidate => candidate.index! > start)?.index ?? patch.length;
+    const chunk = patch.slice(start, next);
+    const operation = operations[header[1]!] ?? 'modify';
+    if (operation === 'create') {
+      if (!/^new file mode 100644$/m.test(chunk) || !/^--- \/dev\/null$/m.test(chunk) || !chunk.includes(`+++ b/${header[1]}\n`)) {
+        throw new Error('Created-file patch has malformed headers or an unsafe mode.');
+      }
+    } else if (!chunk.includes(`--- a/${header[1]}\n`) || !chunk.includes(`+++ b/${header[1]}\n`) || /^new file mode /m.test(chunk)) {
+      throw new Error('Patch operation or headers differ from the authorized modification.');
     }
   }
   if (actual.size !== expectedFiles.length || [...patch.matchAll(/^--- /gm)].length !== expectedFiles.length ||
@@ -181,6 +194,80 @@ function diffSummary(patch: string): { addedLines: number; removedLines: number;
   return { addedLines, removedLines, changedLines: addedLines + removedLines };
 }
 
+function patchChunks(patch: string): Array<{ file: string; text: string }> {
+  const headers = [...patch.matchAll(/^diff --git a\/(.+) b\/(.+)$/gm)];
+  return headers.map((header, index) => ({
+    file: header[1]!,
+    text: patch.slice(header.index!, headers[index + 1]?.index ?? patch.length),
+  }));
+}
+
+async function newFileWorkingTreePatch(root: string, file: string): Promise<string> {
+  try {
+    await execFileAsync('git', ['-C', root, 'diff', '--no-index', '--binary', '--', '/dev/null', file], {
+      encoding: 'utf8', timeout: 30_000, maxBuffer: MAX_PATCH_BYTES,
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+    });
+    throw new Error(`Created file unexpectedly has no content diff: ${file}`);
+  } catch (error) {
+    const failure = error as NodeJS.ErrnoException & { code?: number; stdout?: string; stderr?: string };
+    if (failure.code !== 1 || !failure.stdout) throw new Error(`Unable to inspect created file ${file}: ${failure.stderr ?? failure.message}`);
+    return failure.stdout;
+  }
+}
+
+async function workingTreePatch(root: string, files: string[], operations: Record<string, 'modify' | 'create'>): Promise<string> {
+  const modified = files.filter(file => operations[file] !== 'create').sort();
+  const created = files.filter(file => operations[file] === 'create').sort();
+  const parts: string[] = [];
+  if (modified.length > 0) parts.push(await git(root, ['diff', '--no-ext-diff', '--binary', '--', ...modified], MAX_PATCH_BYTES));
+  for (const file of created) parts.push(await newFileWorkingTreePatch(root, file));
+  return parts.filter(Boolean).join('');
+}
+
+async function materializePatchResults(
+  repositoryRoot: string,
+  patch: string,
+  files: string[],
+  operations: Record<string, 'modify' | 'create'>,
+): Promise<{ hashes: Record<string, string>; contents: Record<string, string> }> {
+  const temporary = await mkdtemp(join(tmpdir(), 'hybrid-agent-patch-'));
+  try {
+    for (const file of files) {
+      const destination = resolve(temporary, file);
+      await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
+      if (operations[file] !== 'create') {
+        await resolveSafeTargetPath(repositoryRoot, file, EXECUTION_PROTECTED_PATHS);
+        await writeFile(destination, await headFile(repositoryRoot, file), { flag: 'wx', mode: 0o600 });
+      }
+    }
+    const patchPath = resolve(temporary, 'authorized.patch');
+    await writeFile(patchPath, patch, { flag: 'wx', mode: 0o600 });
+    try {
+      await execFileAsync('git', ['apply', '--whitespace=nowarn', patchPath], {
+        cwd: temporary, encoding: 'utf8', timeout: 30_000, maxBuffer: MAX_PATCH_BYTES,
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+      });
+    } catch (error) {
+      throw new Error(`Unable to materialize approved patch results: ${sanitizeCloudText(error instanceof Error ? error.message : String(error), 2_000)}`);
+    }
+    const hashes: Record<string, string> = {};
+    const contents: Record<string, string> = {};
+    for (const file of files) {
+      const path = resolve(temporary, file);
+      const stat = await lstat(path);
+      if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`Patch result is not a regular file: ${file}.`);
+      const content = await readFile(path, 'utf8');
+      if (content.includes('\u0000')) throw new Error(`Patch result is binary: ${file}.`);
+      contents[file] = content;
+      hashes[file] = sha256(content);
+    }
+    return { hashes, contents };
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+}
+
 async function loadRunBundle(project: string, runId: string): Promise<{ identity: RepositoryIdentity; bundle: RunBundle }> {
   if (!RUN_ID.test(runId)) throw new Error('run-id must be a UUID.');
   const identity = await repositoryIdentity(project);
@@ -189,9 +276,14 @@ async function loadRunBundle(project: string, runId: string): Promise<{ identity
   if (report.run_id !== runId) throw new Error('Orchestration report run ID does not match the requested run.');
   if (await realpath(report.project).catch(() => '') !== identity.root) throw new Error('Orchestration report targets a different repository.');
   const selectedTasks = report.selected_tasks ?? (report.selected_task ? [report.selected_task] : []);
-  if (selectedTasks.length === 0 || selectedTasks.some(task => task.operation !== 'modify_existing' || task.file_scope.length !== 1)) {
-    throw new Error('Orchestration report does not contain supported existing-file tasks.');
+  if (selectedTasks.length === 0 || selectedTasks.some(task => !['modify_existing', 'create'].includes(task.operation) || task.file_scope.length !== 1)) {
+    throw new Error('Orchestration report does not contain supported one-file modify/create tasks.');
   }
+  const graphOrder = orderTasksByDependencies(selectedTasks).map(task => task.task_id);
+  if (report.mode === 'multi_task' && (
+    JSON.stringify(selectedTasks.map(task => task.task_id)) !== JSON.stringify(graphOrder) ||
+    JSON.stringify(report.execution_order ?? []) !== JSON.stringify(graphOrder)
+  )) throw new Error('Orchestration report contains an invalid or inconsistent dependency execution order.');
   if (!report.execution_report_path || !report.final_patch_path) throw new Error('Orchestration report has no execution report or final patch reference.');
   const executionArtifact = await runArtifact(identity.root, report.execution_report_path, '.json', MAX_JSON_BYTES);
   const local = await readRunArtifact(identity.root, executionArtifact.path);
@@ -201,10 +293,14 @@ async function loadRunBundle(project: string, runId: string): Promise<{ identity
     throw new Error('Patch reference is inconsistent with the execution report.');
   }
   const files = selectedTasks.map(task => task.file_scope[0]!).sort();
+  const operations = Object.fromEntries(selectedTasks.map(task => [task.file_scope[0]!, task.operation === 'create' ? 'create' : 'modify'])) as Record<string, 'modify' | 'create'>;
   const reportedFiles = (local.report.proposed_files ?? (local.report.proposed_file ? [local.report.proposed_file] : [])).sort();
   if (JSON.stringify(reportedFiles) !== JSON.stringify(files)) throw new Error('Execution report file scope differs from the selected tasks.');
+  if (local.report.proposed_operations && files.some(file => local.report.proposed_operations?.[file] !== operations[file])) {
+    throw new Error('Execution report operations differ from the selected tasks.');
+  }
   const patch = referencedPatch.bytes.toString('utf8');
-  patchFiles(patch, files);
+  patchFiles(patch, files, operations);
   if (report.final_patch_sha256 && report.final_patch_sha256 !== sha256(referencedPatch.bytes)) {
     throw new Error('Orchestration report patch digest does not match the referenced patch.');
   }
@@ -223,6 +319,8 @@ async function loadRunBundle(project: string, runId: string): Promise<{ identity
   }
 
   const originalSha256: Record<string, string> = {};
+  const resultingSha256: Record<string, string> = {};
+  const resultingContent: Record<string, string> = {};
   const proposalReferences = report.mode === 'multi_task'
     ? (report.task_results ?? []).map(result => ({ file: result.file, path: result.proposal_path }))
     : [{ file: files[0]!, path: report.proposal_path }];
@@ -233,10 +331,19 @@ async function loadRunBundle(project: string, runId: string): Promise<{ identity
       proposalPath: reference.path,
       protectedPaths: EXECUTION_PROTECTED_PATHS,
     });
-    if (!validation.proposal || validation.proposal.file !== reference.file || !validation.proposal.original_sha256) {
+    const operation = operations[reference.file];
+    if (!validation.proposal || validation.proposal.file !== reference.file || validation.proposal.operation !== operation ||
+        (operation === 'modify' && !validation.proposal.original_sha256) || (operation === 'create' && validation.proposal.expected_absent !== true)) {
       throw new Error('Initial proposal is missing, malformed, or inconsistent with the approved file.');
     }
-    originalSha256[reference.file] = validation.proposal.original_sha256;
+    if (validation.proposal.original_sha256) originalSha256[reference.file] = validation.proposal.original_sha256;
+    resultingContent[reference.file] = validation.proposal.proposed_content;
+    resultingSha256[reference.file] = sha256(validation.proposal.proposed_content);
+  }
+  const materialized = await materializePatchResults(identity.root, patch, files, operations);
+  for (const file of files) {
+    resultingContent[file] = materialized.contents[file]!;
+    resultingSha256[file] = materialized.hashes[file]!;
   }
 
   return {
@@ -252,7 +359,10 @@ async function loadRunBundle(project: string, runId: string): Promise<{ identity
       patch,
       ...(reviewPath && reviewBytes && review ? { reviewPath, reviewBytes, review } : {}),
       files,
+      operations,
       originalSha256,
+      resultingSha256,
+      resultingContent,
     },
   };
 }
@@ -275,7 +385,15 @@ export async function inspectOrchestrationRun(project: string, runId: string): P
     const outcomesMatch = outcomes.length === selected.length && outcomes.every((outcome, index) =>
       outcome.task_id === selected[index]?.task_id && outcome.file === selected[index]?.file_scope[0] &&
       outcome.order === index + 1 && outcome.status === 'passed' && outcome.proposal_validation === 'passed');
-    if (JSON.stringify(actualOrder) !== JSON.stringify(expectedOrder) || !outcomesMatch) {
+    const dependencyMetadataMatches = outcomes.every((outcome, index) => {
+      const dependencies = selected[index]?.dependencies ?? [];
+      if (dependencies.length === 0 && outcome.dependencies === undefined) return true;
+      const sourcePrecondition = outcome.operation === 'create' ? outcome.expected_absent_before === true : Boolean(outcome.source_sha256_before);
+      return JSON.stringify(outcome.dependencies) === JSON.stringify(dependencies) &&
+        outcome.authorized_files?.length === 1 && outcome.authorized_files[0] === outcome.file &&
+        Boolean(outcome.started_at && outcome.completed_at && sourcePrecondition && outcome.source_sha256_after);
+    });
+    if (JSON.stringify(actualOrder) !== JSON.stringify(expectedOrder) || !outcomesMatch || !dependencyMetadataMatches) {
       reasons.push('Multi-task execution order or per-task outcomes are incomplete or inconsistent.');
     }
     if (bundle.report.combined_checks?.status !== 'passed') reasons.push('Final combined trusted validation did not pass.');
@@ -291,20 +409,22 @@ export async function inspectOrchestrationRun(project: string, runId: string): P
   }
   warnings.push(...local.report.errors);
   for (const file of bundle.files) {
-    const target = await resolveSafeTargetPath(identity.root, file, EXECUTION_PROTECTED_PATHS).catch(error => {
+    const target = await (bundle.operations[file] === 'create'
+      ? resolveSafeCreationPath(identity.root, file, EXECUTION_PROTECTED_PATHS)
+      : resolveSafeTargetPath(identity.root, file, EXECUTION_PROTECTED_PATHS)).catch(error => {
       reasons.push(error instanceof Error ? error.message : String(error));
       return undefined;
     });
-    if (target && bundle.originalSha256[file]) {
+    if (target && bundle.operations[file] === 'modify' && bundle.originalSha256[file]) {
       const current = sha256(await readFile(target.path));
       if (current !== bundle.originalSha256[file]) reasons.push(`The authorized source changed after proposal generation: ${file}.`);
-    } else if (!bundle.originalSha256[file]) {
+    } else if (bundle.operations[file] === 'modify' && !bundle.originalSha256[file]) {
       reasons.push(`The run does not contain a verifiable original source digest for ${file}.`);
     }
   }
   const summary = diffSummary(bundle.patch);
   const selectedTasks = (bundle.report.selected_tasks ?? (bundle.report.selected_task ? [bundle.report.selected_task] : []))
-    .map(task => ({ taskId: task.task_id, file: task.file_scope[0]! }));
+    .map(task => ({ taskId: task.task_id, file: task.file_scope[0]!, operation: task.operation === 'create' ? 'create' as const : 'modify' as const, dependencies: task.dependencies }));
   return {
     runId,
     task: bundle.report.request,
@@ -397,10 +517,14 @@ export async function approveOrchestrationRun(options: ApprovalOptions): Promise
   if (files.length < 1 || files.length > 5 || new Set(files).size !== files.length) throw new Error('Approval requires between one and five unique authorized files.');
   const sourceSha256: Record<string, string> = {};
   for (const file of files) {
-    const target = await resolveSafeTargetPath(identity.root, file, EXECUTION_PROTECTED_PATHS);
-    const sourceHash = sha256(await readFile(target.path));
-    if (!bundle.originalSha256[file] || sourceHash !== bundle.originalSha256[file]) throw new Error(`The original source changed after the run: ${file}.`);
-    sourceSha256[file] = sourceHash;
+    if (bundle.operations[file] === 'create') {
+      await resolveSafeCreationPath(identity.root, file, EXECUTION_PROTECTED_PATHS);
+    } else {
+      const target = await resolveSafeTargetPath(identity.root, file, EXECUTION_PROTECTED_PATHS);
+      const sourceHash = sha256(await readFile(target.path));
+      if (!bundle.originalSha256[file] || sourceHash !== bundle.originalSha256[file]) throw new Error(`The original source changed after the run: ${file}.`);
+      sourceSha256[file] = sourceHash;
+    }
   }
   await git(identity.root, ['apply', '--check', '--whitespace=nowarn', bundle.patchPath]);
   const key = await signingKey(identity.root, true);
@@ -418,6 +542,9 @@ export async function approveOrchestrationRun(options: ApprovalOptions): Promise
     patch_sha256: sha256(bundle.patchBytes),
     approved_files: files,
     source_sha256: sourceSha256,
+    file_operations: bundle.operations,
+    resulting_sha256: bundle.resultingSha256,
+    expected_absent: files.filter(file => bundle.operations[file] === 'create'),
     orchestration_report_sha256: sha256(bundle.reportBytes),
     execution_report_sha256: sha256(bundle.executionReportBytes),
     validation_artifact_sha256: sha256(bundle.executionReportBytes),
@@ -513,8 +640,10 @@ export async function integrateApprovedRun(options: IntegrationOptions): Promise
   if (approval.record.run_id !== options.runId || approval.record.repository_root !== identity.root || approval.record.repository_id !== identity.id) {
     throw new Error('Approval record is bound to a different run or repository.');
   }
+  if (identity.head !== approval.record.head_at_approval) throw new Error('Repository HEAD changed after approval.');
   const integrationId = randomUUID();
   const attemptedAt = new Date().toISOString();
+  const approvedFileOperations = approval.record.file_operations ?? Object.fromEntries(approval.record.approved_files.map(file => [file, 'modify' as const]));
   const locks: Array<Awaited<ReturnType<typeof acquireExecutionLock>>> = [];
   let backups = new Map<string, Buffer>();
   const targetPaths = new Map<string, string>();
@@ -522,14 +651,21 @@ export async function integrateApprovedRun(options: IntegrationOptions): Promise
   let changedFiles: string[] = [];
   let auditPath = '';
   let verifiedPatchPath: string | undefined;
+  let applicationPatchPath: string | undefined;
   try {
     const files = [...approval.record.approved_files].sort();
     if (files.length < 1 || files.length > 5 || new Set(files).size !== files.length ||
         JSON.stringify(files) !== JSON.stringify(approval.record.approved_files)) {
       throw new Error('Approval must contain a sorted set of one to five unique files.');
     }
-    if (JSON.stringify(Object.keys(approval.record.source_sha256).sort()) !== JSON.stringify(files)) {
+    const approvedOperations = approvedFileOperations;
+    const modifiedFiles = files.filter(file => approvedOperations[file] !== 'create');
+    if (JSON.stringify(Object.keys(approval.record.source_sha256).sort()) !== JSON.stringify(modifiedFiles)) {
       throw new Error('Approval source digests do not exactly match the approved file set.');
+    }
+    if (JSON.stringify(Object.keys(approvedOperations).sort()) !== JSON.stringify(files)) throw new Error('Approval operations do not exactly match the approved file set.');
+    if (approval.record.resulting_sha256 && JSON.stringify(Object.keys(approval.record.resulting_sha256).sort()) !== JSON.stringify(files)) {
+      throw new Error('Approval result digests do not exactly match the approved file set.');
     }
     for (const file of files) locks.push(await acquireExecutionLock(identity.root, `${identity.root}\0${file}`, integrationId));
     const { identity: currentIdentity, bundle } = await loadRunBundle(identity.root, options.runId);
@@ -549,25 +685,42 @@ export async function integrateApprovedRun(options: IntegrationOptions): Promise
       throw new Error('The approved validation artifact was altered after approval.');
     }
     if (JSON.stringify([...bundle.files].sort()) !== JSON.stringify(files)) throw new Error('Approved file set differs from the run and patch scope.');
-    patchFiles(bundle.patch, files);
+    if (files.some(file => bundle.operations[file] !== approvedOperations[file])) throw new Error('Approved operations differ from the run operations.');
+    if (approval.record.resulting_sha256 && files.some(file => bundle.resultingSha256[file] !== approval.record.resulting_sha256?.[file])) {
+      throw new Error('Approved resulting source digests differ from the run.');
+    }
+    patchFiles(bundle.patch, files, approvedOperations);
     const integrations = await privateStateSubdirectory(identity.root, 'integrations');
     verifiedPatchPath = resolve(integrations, `.${integrationId}.approved.patch`);
     await writeFile(verifiedPatchPath, bundle.patchBytes, { flag: 'wx', mode: 0o600 });
     const dirty = relevantStatusEntries(await git(identity.root, ['status', '--porcelain=v1', '-z', '--untracked-files=all']));
     if (dirty.length > 0) throw new Error('The target working tree or index has tracked changes or untracked files outside protected agent artifacts.');
     for (const file of files) {
-      const target = await resolveSafeTargetPath(identity.root, file, EXECUTION_PROTECTED_PATHS);
-      const original = await readFile(target.path);
-      if (sha256(original) !== approval.record.source_sha256[file]) throw new Error(`The approved source file is stale: ${file}.`);
-      backups.set(target.path, original);
-      targetPaths.set(file, target.path);
+      if (approvedOperations[file] === 'create') {
+        const target = await resolveSafeCreationPath(identity.root, file, EXECUTION_PROTECTED_PATHS);
+        targetPaths.set(file, target.path);
+      } else {
+        const target = await resolveSafeTargetPath(identity.root, file, EXECUTION_PROTECTED_PATHS);
+        const original = await readFile(target.path);
+        if (sha256(original) !== approval.record.source_sha256[file]) throw new Error(`The approved source file is stale: ${file}.`);
+        backups.set(target.path, original);
+        targetPaths.set(file, target.path);
+      }
     }
     await git(identity.root, ['apply', '--check', '--whitespace=nowarn', verifiedPatchPath]);
     applicationStarted = true;
-    await (options.adapter ?? new GitPatchApplicationAdapter()).apply(identity.root, verifiedPatchPath);
+    const modifierPatch = patchChunks(bundle.patch).filter(chunk => approvedOperations[chunk.file] !== 'create').map(chunk => chunk.text).join('');
+    if (modifierPatch) {
+      applicationPatchPath = resolve(integrations, `.${integrationId}.modify.patch`);
+      await writeFile(applicationPatchPath, modifierPatch, { flag: 'wx', mode: 0o600 });
+      await (options.adapter ?? new GitPatchApplicationAdapter()).apply(identity.root, applicationPatchPath);
+    }
+    for (const file of files.filter(file => approvedOperations[file] === 'create')) {
+      await writeFile(targetPaths.get(file)!, bundle.resultingContent[file]!, { flag: 'wx', mode: 0o644, encoding: 'utf8' });
+    }
     changedFiles = relevantStatusEntries(await git(identity.root, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])).map(entry => entry.path).sort();
     if (JSON.stringify(changedFiles) !== JSON.stringify(files)) throw new Error('Patch application changed files outside the approved scope or omitted part of the complete file set.');
-    const actualPatch = await git(identity.root, ['diff', '--no-ext-diff', '--binary', '--', ...files], MAX_PATCH_BYTES);
+    const actualPatch = await workingTreePatch(identity.root, files, approvedOperations);
     if (actualPatch !== bundle.patch) throw new Error('Resulting working-tree diff does not exactly match the approved patch.');
     const resultingSourceSha256: Record<string, string> = {};
     for (const file of files) resultingSourceSha256[file] = sha256(await readFile(targetPaths.get(file)!));
@@ -580,6 +733,7 @@ export async function integrateApprovedRun(options: IntegrationOptions): Promise
       patch_sha256: approval.record.patch_sha256, approval_path: approval.path, approved_files: files,
       status: 'succeeded', changed_files: changedFiles,
       original_source_sha256: approval.record.source_sha256, resulting_source_sha256: resultingSourceSha256,
+      file_operations: approvedOperations,
       rollback: { attempted: false, succeeded: true, manual_recovery_required: false, affected_paths: [] },
       commit_created: false, push_performed: false, merge_performed: false, deployment_performed: false,
     };
@@ -607,6 +761,25 @@ export async function integrateApprovedRun(options: IntegrationOptions): Promise
           rollbackErrors.push(rollbackError instanceof Error ? rollbackError.message : String(rollbackError));
         }
       }
+      for (const file of approval.record.approved_files.filter(file => approvedFileOperations[file] === 'create')) {
+        const path = targetPaths.get(file);
+        if (!path) continue;
+        try {
+          const stat = await lstat(path).catch(error => {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+            throw error;
+          });
+          if (!stat) continue;
+          if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`Cannot safely remove non-regular created target ${file}.`);
+          const actualHash = sha256(await readFile(path));
+          const expectedHash = approval.record.resulting_sha256?.[file];
+          if (!expectedHash) throw new Error(`Approval lacks the created target digest for ${file}.`);
+          if (actualHash !== expectedHash) throw new Error(`Created target changed independently during rollback: ${file}.`);
+          await rm(path, { force: false });
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError instanceof Error ? rollbackError.message : String(rollbackError));
+        }
+      }
       const entries = relevantStatusEntries(await git(identity.root, ['status', '--porcelain=v1', '-z', '--untracked-files=all']).catch(() => ''));
       for (const entry of entries) {
         const path = resolve(identity.root, entry.path);
@@ -615,7 +788,7 @@ export async function integrateApprovedRun(options: IntegrationOptions): Promise
           continue;
         }
         if (entry.code === '??') {
-          await rm(path, { recursive: true, force: true }).catch(rollbackError => rollbackErrors.push(rollbackError instanceof Error ? rollbackError.message : String(rollbackError)));
+          rollbackErrors.push(`Refusing to remove unexpected untracked path during rollback: ${entry.path}`);
           continue;
         }
         if (backups.has(path)) continue;
@@ -632,9 +805,13 @@ export async function integrateApprovedRun(options: IntegrationOptions): Promise
       const remaining = relevantStatusEntries(await git(identity.root, ['status', '--porcelain=v1', '-z', '--untracked-files=all']).catch(() => ''));
       if (remaining.length > 0) rollbackErrors.push('Working tree was not clean after rollback.');
       for (const [file, path] of targetPaths) {
-        const expected = approval.record.source_sha256[file];
         const actual = await readFile(path).then(value => sha256(value), () => undefined);
-        if (!expected || actual !== expected) rollbackErrors.push(`Rollback digest mismatch: ${file}`);
+        if (approvedFileOperations[file] === 'create') {
+          if (actual !== undefined) rollbackErrors.push(`Created target still exists after rollback: ${file}`);
+        } else {
+          const expected = approval.record.source_sha256[file];
+          if (!expected || actual !== expected) rollbackErrors.push(`Rollback digest mismatch: ${file}`);
+        }
       }
       rollbackSucceeded = rollbackErrors.length === 0;
       manualRecoveryRequired = !rollbackSucceeded;
@@ -657,6 +834,7 @@ export async function integrateApprovedRun(options: IntegrationOptions): Promise
       patch_sha256: approval.record.patch_sha256, approval_path: approval.path,
       approved_files: approval.record.approved_files, status: 'failed', changed_files: remainingFiles, error: message,
       original_source_sha256: approval.record.source_sha256, resulting_source_sha256: resultingSourceSha256,
+      file_operations: approval.record.file_operations,
       rollback: {
         attempted: rollbackAttempted, succeeded: rollbackSucceeded,
         manual_recovery_required: manualRecoveryRequired,
@@ -668,6 +846,7 @@ export async function integrateApprovedRun(options: IntegrationOptions): Promise
     throw new Error(message);
   } finally {
     if (verifiedPatchPath) await rm(verifiedPatchPath, { force: true }).catch(() => undefined);
+    if (applicationPatchPath) await rm(applicationPatchPath, { force: true }).catch(() => undefined);
     for (const lock of locks.reverse()) await releaseExecutionLock(lock);
   }
 }

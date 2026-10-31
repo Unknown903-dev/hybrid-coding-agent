@@ -76,8 +76,9 @@ function boundedTaskInstruction(request: string, task: OrchestrationReport['sele
     `Assigned task: ${task.title}`,
     `Description: ${task.description}`,
     `Authorized file (only): ${task.file_scope[0]}`,
+    `Authorized operation: ${task.operation === 'create' ? 'create an absent source/test file' : 'modify an existing file'}`,
     `Acceptance criteria:\n- ${task.acceptance_criteria.join('\n- ')}`,
-    'Constraints: modify only the authorized existing file; preserve unrelated behavior and public interfaces; do not add commands, files, or permissions; return a proposal only.',
+    'Constraints: perform only the declared operation on the authorized file; preserve unrelated behavior and public interfaces; do not add commands, other files, directories, or permissions; return a proposal only.',
   ].join('\n'), 8_000);
 }
 
@@ -203,11 +204,11 @@ export async function runOrchestration(options: RunCoordinatorOptions): Promise<
     if (!finding?.local_eligible) {
       return await block(`The only task is not eligible for deterministic local execution: ${finding?.reasons.join(' ') ?? 'routing finding missing'}`);
     }
-    if (selected.operation !== 'modify_existing' || selected.file_scope.length !== 1 || selected.dependencies.length !== 0) {
-      return await block('The selected task is outside the supported single-existing-file scope or has unresolved dependencies.');
+    if (!['modify_existing', 'create'].includes(selected.operation) || selected.file_scope.length !== 1 || selected.dependencies.length !== 0) {
+      return await block('The selected task is outside the supported single-file modify/create scope or has unresolved dependencies.');
     }
     report.selected_task = selected;
-    await verifyTrackedAtHead(projectRoot, selected.file_scope[0]!);
+    if (selected.operation === 'modify_existing') await verifyTrackedAtHead(projectRoot, selected.file_scope[0]!);
 
     if (options.dryRun) {
       await transition('awaiting_human_review', 'Dry-run planning completed; no local proposal, worktree, checks, or cloud review were started.');
@@ -221,6 +222,7 @@ export async function runOrchestration(options: RunCoordinatorOptions): Promise<
     const proposalPath = await proposeLocalChange({
       project: projectRoot,
       file: selected.file_scope[0]!,
+      operation: selected.operation === 'create' ? 'create' : 'modify',
       task: boundedTaskInstruction(request, selected),
       model: localModel,
       ...(options.proposalAdapter ? { adapter: options.proposalAdapter } : {}),
@@ -231,8 +233,11 @@ export async function runOrchestration(options: RunCoordinatorOptions): Promise<
       proposalPath,
       protectedPaths: EXECUTION_PROTECTED_PATHS,
     });
-    if (!validation.valid || !validation.proposal || !validation.proposal.original_sha256 ||
-        validation.originalSha256 !== validation.proposal.original_sha256 || validation.proposal.file !== selected.file_scope[0]) {
+    const proposalPreconditionValid = validation.proposal?.operation === 'create'
+      ? validation.proposal.expected_absent === true
+      : Boolean(validation.proposal?.original_sha256 && validation.originalSha256 === validation.proposal.original_sha256);
+    if (!validation.valid || !validation.proposal || !proposalPreconditionValid ||
+        validation.proposal.operation !== (selected.operation === 'create' ? 'create' : 'modify') || validation.proposal.file !== selected.file_scope[0]) {
       report.validation.proposal = 'failed';
       throw new Error(`Generated proposal failed authorization, structure, or source-digest validation: ${validation.errors.join('; ')}`);
     }
