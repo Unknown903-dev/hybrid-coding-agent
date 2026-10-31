@@ -119,6 +119,7 @@ export async function runOrchestration(options: RunCoordinatorOptions): Promise<
     transitions: [{ state: 'created', timestamp: startedAt }],
     started_at: startedAt,
     dry_run: options.dryRun === true,
+    mode: 'single_task',
     local_model: localModel,
     ...(options.cloudModel ? { cloud_model: options.cloudModel } : {}),
     cloud_usage: {
@@ -130,6 +131,7 @@ export async function runOrchestration(options: RunCoordinatorOptions): Promise<
     },
     validation: { plan: 'not_run', proposal: 'not_run', automated_checks: 'not_run' },
     final_review: { status: 'not_requested' },
+    human_approval_status: 'not_available',
     human_approval_required: true,
   };
 
@@ -276,6 +278,7 @@ export async function runOrchestration(options: RunCoordinatorOptions): Promise<
       report.cloud_review_path = reviewed.reviewPath;
       report.cloud_usage_path = reviewed.usagePath;
       report.final_review = { status: 'completed', verdict: reviewed.review.verdict };
+      report.human_approval_status = reviewed.review.verdict === 'ready_for_human_review' ? 'pending' : 'not_available';
       await transition('awaiting_human_review', `Cloud review recommendation: ${reviewed.review.verdict}. Human approval remains required.`);
       return await finish();
     } catch (error) {

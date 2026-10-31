@@ -99,6 +99,7 @@ export interface RepairAttemptReport {
 
 export type RepairStopReason =
   | 'checks_passed'
+  | 'checks_deferred'
   | 'authorization_required'
   | 'initial_validation_failed'
   | 'stale_proposal'
@@ -151,6 +152,12 @@ export interface RepairCoordinatorOptions {
   commands?: TrustedCommand[];
   adapter?: RepairModelAdapter;
   onRepairStart?: () => void | Promise<void>;
+  callerOwnedWorktree?: {
+    path: string;
+    allowedModifiedFiles: string[];
+    lockAlreadyHeld: boolean;
+  };
+  deferChecks?: boolean;
 }
 
 interface ProcessResult {
@@ -259,7 +266,9 @@ function parseModifiedFiles(status: string): string[] {
   for (let index = 0; index < entries.length; index += 1) {
     const entry = entries[index]!;
     const path = entry.slice(3).replaceAll('\\', '/');
-    paths.push(path);
+    const agentArtifact = ['.agent-proposals', '.agent-runs', '.agent-worktrees', '.agent-state']
+      .some(directory => path === directory || path.startsWith(`${directory}/`));
+    if (entry.slice(0, 2) !== '??' || !agentArtifact) paths.push(path);
     if (entry[0] === 'R' || entry[1] === 'R' || entry[0] === 'C' || entry[1] === 'C') index += 1;
   }
   return [...new Set(paths)].sort();
@@ -359,9 +368,10 @@ export async function coordinateRepair(options: RepairCoordinatorOptions): Promi
     throw new Error(`totalTimeBudgetMs must be between 1 and ${MAX_TOTAL_TIME_BUDGET_MS}.`);
   }
   const projectRoot = await realpath(options.project);
-  const report = initialReport(taskId, resolve(projectRoot, options.proposalPath), startedAt, maxRetries);
+  const validationRoot = options.callerOwnedWorktree ? await realpath(options.callerOwnedWorktree.path) : projectRoot;
+  const report = initialReport(taskId, resolve(validationRoot, options.proposalPath), startedAt, maxRetries);
   const worktreeRoot = resolve(projectRoot, '.agent-worktrees');
-  const worktreePath = resolve(worktreeRoot, taskId);
+  const worktreePath = options.callerOwnedWorktree ? validationRoot : resolve(worktreeRoot, taskId);
   const disabledHooks = resolve(projectRoot, '.agent-runs', '.disabled-hooks');
   let lock: { handle: FileHandle; path: string } | undefined;
   let worktreeCreated = false;
@@ -376,9 +386,12 @@ export async function coordinateRepair(options: RepairCoordinatorOptions): Promi
 
   try {
     if (!options.apply) fail('authorization_required', 'Repair requires explicit authorization with --apply.');
+    if (options.callerOwnedWorktree && !isInside(worktreeRoot, worktreePath)) {
+      fail('internal_error', 'Caller-owned worktree is outside the protected worktree root.');
+    }
 
     let validation = await validateProposal({
-      project: projectRoot,
+      project: validationRoot,
       proposalPath: options.proposalPath,
       protectedPaths: EXECUTION_PROTECTED_PATHS,
     });
@@ -395,23 +408,27 @@ export async function coordinateRepair(options: RepairCoordinatorOptions): Promi
       fail('stale_proposal', 'Initial proposal is stale or lacks the required original_sha256.');
     }
 
-    try {
-      lock = await acquireExecutionLock(projectRoot, `${projectRoot}\0${authorizedFile}`, taskId);
-    } catch (error) {
-      fail('concurrent_execution', error instanceof Error ? error.message : String(error));
+    if (!options.callerOwnedWorktree?.lockAlreadyHeld) {
+      try {
+        lock = await acquireExecutionLock(projectRoot, `${projectRoot}\0${authorizedFile}`, taskId);
+      } catch (error) {
+        fail('concurrent_execution', error instanceof Error ? error.message : String(error));
+      }
     }
     const commands = options.commands ?? await loadTrustedCommands(projectRoot);
-    if (commands.length === 0) fail('no_trusted_checks', 'No trusted validation commands are configured.');
+    if (commands.length === 0 && !options.deferChecks) fail('no_trusted_checks', 'No trusted validation commands are configured.');
 
-    await mkdir(worktreeRoot, { recursive: true, mode: 0o700 });
-    await mkdir(disabledHooks, { recursive: true, mode: 0o700 });
-    if (!isInside(worktreeRoot, worktreePath)) fail('internal_error', 'Refusing unsafe repair worktree location.');
-    const added = await runProcess('git', ['-c', `core.hooksPath=${disabledHooks}`, 'worktree', 'add', '--detach', worktreePath, 'HEAD'], projectRoot);
-    if (added.code !== 0) fail('internal_error', `Unable to create repair worktree: ${added.error ?? added.stderr}`);
-    worktreeCreated = true;
+    if (!options.callerOwnedWorktree) {
+      await mkdir(worktreeRoot, { recursive: true, mode: 0o700 });
+      await mkdir(disabledHooks, { recursive: true, mode: 0o700 });
+      if (!isInside(worktreeRoot, worktreePath)) fail('internal_error', 'Refusing unsafe repair worktree location.');
+      const added = await runProcess('git', ['-c', `core.hooksPath=${disabledHooks}`, 'worktree', 'add', '--detach', worktreePath, 'HEAD'], projectRoot);
+      if (added.code !== 0) fail('internal_error', `Unable to create repair worktree: ${added.error ?? added.stderr}`);
+      worktreeCreated = true;
+    }
     report.worktree.location = worktreePath;
 
-    validation = await validateProposal({ project: projectRoot, proposalPath: options.proposalPath, protectedPaths: EXECUTION_PROTECTED_PATHS });
+    validation = await validateProposal({ project: validationRoot, proposalPath: options.proposalPath, protectedPaths: EXECUTION_PROTECTED_PATHS });
     if (!validation.valid || !validation.proposal || !validation.diff || !validation.proposal.original_sha256 || validation.originalSha256 !== validation.proposal.original_sha256) {
       fail('stale_proposal', 'Initial proposal became stale before worktree application.');
     }
@@ -444,9 +461,35 @@ export async function coordinateRepair(options: RepairCoordinatorOptions): Promi
       await writeFile(target.path, currentProposal.proposed_content, 'utf8');
       expectedCurrentHash = proposalHash;
 
+      const allowedFiles = new Set([
+        authorizedFile.replaceAll('\\', '/'),
+        ...(options.callerOwnedWorktree?.allowedModifiedFiles.map(file => file.replaceAll('\\', '/')) ?? []),
+      ]);
       const beforeChecksFiles = await modifiedFiles(worktreePath);
-      if (beforeChecksFiles.some(file => file !== authorizedFile.replaceAll('\\', '/'))) {
+      if (beforeChecksFiles.some(file => !allowedFiles.has(file))) {
         fail('unauthorized_file_modification', 'Proposal application modified a file outside the authorized target.');
+      }
+
+      if (options.deferChecks) {
+        report.attempts.push({
+          attempt: report.attempts.length + 1,
+          kind: retryCount === 0 ? 'initial' : 'repair',
+          retry_count: retryCount,
+          proposal_valid: true,
+          proposal_hash: proposalHash,
+          proposal_summary: currentProposal.summary,
+          validation_errors: [],
+          checks_status: 'skipped',
+          checks: [],
+          modified_files: beforeChecksFiles,
+          diff_summary: (({ unifiedDiff: _omitted, ...summary }) => summary)(currentDiff),
+          duration_ms: Date.now() - attemptStarted,
+        });
+        report.status = 'passed';
+        report.stop_reason = 'checks_deferred';
+        report.automated_checks = 'skipped';
+        report.cloud_escalation_recommended = false;
+        break;
       }
 
       const checks: CheckResult[] = [];
@@ -460,8 +503,8 @@ export async function coordinateRepair(options: RepairCoordinatorOptions): Promi
       const files = await modifiedFiles(worktreePath);
       const afterChecksContent = await readFile(target.path, 'utf8');
       if (hash(afterChecksContent) !== expectedCurrentHash) fail('unexpected_source_change', 'A trusted check changed the authorized source unexpectedly.');
-      if (files.some(file => file !== authorizedFile.replaceAll('\\', '/'))) {
-        fail('unauthorized_file_modification', `Trusted checks modified unauthorized files: ${files.filter(file => file !== authorizedFile.replaceAll('\\', '/')).join(', ')}`);
+      if (files.some(file => !allowedFiles.has(file))) {
+        fail('unauthorized_file_modification', `Trusted checks modified unauthorized files: ${files.filter(file => !allowedFiles.has(file)).join(', ')}`);
       }
 
       const checksPassed = checks.length === commands.length && checks.every(check => check.status === 'passed');
@@ -627,7 +670,9 @@ export async function coordinateRepair(options: RepairCoordinatorOptions): Promi
       }
     }
   } finally {
-    if (worktreeCreated && !options.keepWorktree) {
+    if (options.callerOwnedWorktree) {
+      report.worktree.preserved = true;
+    } else if (worktreeCreated && !options.keepWorktree) {
       const removed = await runProcess('git', ['-c', `core.hooksPath=${disabledHooks}`, 'worktree', 'remove', '--force', worktreePath], projectRoot);
       if (removed.code === 0) report.worktree.cleaned = true;
       else {

@@ -34,8 +34,8 @@ interface RunBundle {
   reviewPath?: string;
   reviewBytes?: Buffer;
   review?: SupervisorReview;
-  file: string;
-  originalSha256?: string;
+  files: string[];
+  originalSha256: Record<string, string>;
 }
 
 export interface RunInspection {
@@ -143,22 +143,28 @@ function parseJson<T>(bytes: Buffer, label: string, parse: (value: unknown) => T
   }
 }
 
-function patchFiles(patch: string, expectedFile: string): string[] {
+function patchFiles(patch: string, expectedFiles: string[]): string[] {
   if (/^(?:new file mode|deleted file mode|old mode|new mode|rename (?:from|to)|copy (?:from|to)|GIT binary patch|Binary files )/m.test(patch) ||
       /^--- \/dev\/null$|^\+\+\+ \/dev\/null$/m.test(patch)) {
     throw new Error('Patch contains unsupported creation, deletion, rename, copy, binary, or mode-changing operations.');
   }
   const headers = [...patch.matchAll(/^diff --git a\/(.+) b\/(.+)$/gm)];
-  if (headers.length !== 1 || headers[0]![1] !== expectedFile || headers[0]![2] !== expectedFile) {
-    throw new Error('Patch scope does not exactly match the single authorized file.');
+  if (headers.length !== expectedFiles.length) throw new Error('Patch scope does not match the authorized files.');
+  const actual = new Set<string>();
+  for (const header of headers) {
+    if (header[1] !== header[2] || !header[1] || !expectedFiles.includes(header[1])) {
+      throw new Error('Patch scope does not exactly match the authorized files.');
+    }
+    actual.add(header[1]);
+    if (!patch.includes(`--- a/${header[1]}\n`) || !patch.includes(`+++ b/${header[1]}\n`)) {
+      throw new Error('Patch has malformed or inconsistent file headers.');
+    }
   }
-  if (!patch.includes(`--- a/${expectedFile}\n`) || !patch.includes(`+++ b/${expectedFile}\n`)) {
-    throw new Error('Patch has malformed or inconsistent file headers.');
-  }
-  if ([...patch.matchAll(/^--- /gm)].length !== 1 || [...patch.matchAll(/^\+\+\+ /gm)].length !== 1) {
+  if (actual.size !== expectedFiles.length || [...patch.matchAll(/^--- /gm)].length !== expectedFiles.length ||
+      [...patch.matchAll(/^\+\+\+ /gm)].length !== expectedFiles.length) {
     throw new Error('Patch contains unexpected additional file headers.');
   }
-  return [expectedFile];
+  return [...actual].sort();
 }
 
 function diffSummary(patch: string): { addedLines: number; removedLines: number; changedLines: number } {
@@ -178,8 +184,9 @@ async function loadRunBundle(project: string, runId: string): Promise<{ identity
   const report = parseJson(orchestration.bytes, 'orchestration report', value => orchestrationReportSchema.parse(value));
   if (report.run_id !== runId) throw new Error('Orchestration report run ID does not match the requested run.');
   if (await realpath(report.project).catch(() => '') !== identity.root) throw new Error('Orchestration report targets a different repository.');
-  if (!report.selected_task || report.selected_task.operation !== 'modify_existing' || report.selected_task.file_scope.length !== 1) {
-    throw new Error('Orchestration report does not contain one supported existing-file task.');
+  const selectedTasks = report.selected_tasks ?? (report.selected_task ? [report.selected_task] : []);
+  if (selectedTasks.length === 0 || selectedTasks.some(task => task.operation !== 'modify_existing' || task.file_scope.length !== 1)) {
+    throw new Error('Orchestration report does not contain supported existing-file tasks.');
   }
   if (!report.execution_report_path || !report.final_patch_path) throw new Error('Orchestration report has no execution report or final patch reference.');
   const executionArtifact = await runArtifact(identity.root, report.execution_report_path, '.json', MAX_JSON_BYTES);
@@ -189,10 +196,11 @@ async function loadRunBundle(project: string, runId: string): Promise<{ identity
   if (expectedPatch.path !== referencedPatch.path || !expectedPatch.bytes.equals(referencedPatch.bytes)) {
     throw new Error('Patch reference is inconsistent with the execution report.');
   }
-  const file = report.selected_task.file_scope[0]!;
-  if (local.report.proposed_file !== file) throw new Error('Execution report file scope differs from the selected task.');
+  const files = selectedTasks.map(task => task.file_scope[0]!).sort();
+  const reportedFiles = (local.report.proposed_files ?? (local.report.proposed_file ? [local.report.proposed_file] : [])).sort();
+  if (JSON.stringify(reportedFiles) !== JSON.stringify(files)) throw new Error('Execution report file scope differs from the selected tasks.');
   const patch = referencedPatch.bytes.toString('utf8');
-  patchFiles(patch, file);
+  patchFiles(patch, files);
 
   let reviewPath: string | undefined;
   let reviewBytes: Buffer | undefined;
@@ -207,17 +215,21 @@ async function loadRunBundle(project: string, runId: string): Promise<{ identity
     throw new Error('Orchestration report claims a completed review without a review artifact.');
   }
 
-  let originalSha256: string | undefined;
-  if (report.proposal_path) {
+  const originalSha256: Record<string, string> = {};
+  const proposalReferences = report.mode === 'multi_task'
+    ? (report.task_results ?? []).map(result => ({ file: result.file, path: result.proposal_path }))
+    : [{ file: files[0]!, path: report.proposal_path }];
+  for (const reference of proposalReferences) {
+    if (!reference.path) continue;
     const validation = await validateProposal({
       project: identity.root,
-      proposalPath: report.proposal_path,
+      proposalPath: reference.path,
       protectedPaths: EXECUTION_PROTECTED_PATHS,
     });
-    if (!validation.proposal || validation.proposal.file !== file || !validation.proposal.original_sha256) {
+    if (!validation.proposal || validation.proposal.file !== reference.file || !validation.proposal.original_sha256) {
       throw new Error('Initial proposal is missing, malformed, or inconsistent with the approved file.');
     }
-    originalSha256 = validation.proposal.original_sha256;
+    originalSha256[reference.file] = validation.proposal.original_sha256;
   }
 
   return {
@@ -232,8 +244,8 @@ async function loadRunBundle(project: string, runId: string): Promise<{ identity
       patchBytes: referencedPatch.bytes,
       patch,
       ...(reviewPath && reviewBytes && review ? { reviewPath, reviewBytes, review } : {}),
-      file,
-      ...(originalSha256 ? { originalSha256 } : {}),
+      files,
+      originalSha256,
     },
   };
 }
@@ -258,21 +270,24 @@ export async function inspectOrchestrationRun(project: string, runId: string): P
     warnings.push(...bundle.review.findings.filter(finding => finding.severity !== 'info').map(finding => finding.summary));
   }
   warnings.push(...local.report.errors);
-  const target = await resolveSafeTargetPath(identity.root, bundle.file, EXECUTION_PROTECTED_PATHS).catch(error => {
-    reasons.push(error instanceof Error ? error.message : String(error));
-    return undefined;
-  });
-  if (target && bundle.originalSha256) {
-    const current = sha256(await readFile(target.path));
-    if (current !== bundle.originalSha256) reasons.push('The authorized source changed after proposal generation.');
-  } else if (!bundle.originalSha256) {
-    reasons.push('The run does not contain a verifiable original source digest.');
+  for (const file of bundle.files) {
+    const target = await resolveSafeTargetPath(identity.root, file, EXECUTION_PROTECTED_PATHS).catch(error => {
+      reasons.push(error instanceof Error ? error.message : String(error));
+      return undefined;
+    });
+    if (target && bundle.originalSha256[file]) {
+      const current = sha256(await readFile(target.path));
+      if (current !== bundle.originalSha256[file]) reasons.push(`The authorized source changed after proposal generation: ${file}.`);
+    } else if (!bundle.originalSha256[file]) {
+      reasons.push(`The run does not contain a verifiable original source digest for ${file}.`);
+    }
   }
+  if (bundle.files.length > 1) reasons.push('Multi-file patches are review-only in Milestone 6C.1; signed approval and integration remain single-file only.');
   const summary = diffSummary(bundle.patch);
   return {
     runId,
     task: bundle.report.request,
-    changedFiles: [bundle.file],
+    changedFiles: bundle.files,
     diffSummary: { ...summary, patchSha256: sha256(bundle.patchBytes) },
     patch: bundle.patch,
     automatedValidation: bundle.report.validation,
@@ -353,9 +368,10 @@ export async function approveOrchestrationRun(options: ApprovalOptions): Promise
   const inspection = await inspectOrchestrationRun(options.project, options.runId);
   if (!inspection.eligibleForApproval) throw new Error(`Run is not eligible for approval: ${inspection.ineligibilityReasons.join('; ')}`);
   const { identity, bundle } = await loadRunBundle(options.project, options.runId);
-  const target = await resolveSafeTargetPath(identity.root, bundle.file, EXECUTION_PROTECTED_PATHS);
+  const file = bundle.files[0]!;
+  const target = await resolveSafeTargetPath(identity.root, file, EXECUTION_PROTECTED_PATHS);
   const sourceHash = sha256(await readFile(target.path));
-  if (!bundle.originalSha256 || sourceHash !== bundle.originalSha256) throw new Error('The original source changed after the run.');
+  if (!bundle.originalSha256[file] || sourceHash !== bundle.originalSha256[file]) throw new Error('The original source changed after the run.');
   await git(identity.root, ['apply', '--check', '--whitespace=nowarn', bundle.patchPath]);
   const key = await signingKey(identity.root, true);
   const payload = {
@@ -370,8 +386,8 @@ export async function approveOrchestrationRun(options: ApprovalOptions): Promise
     head_at_approval: identity.head,
     patch_path: bundle.patchPath,
     patch_sha256: sha256(bundle.patchBytes),
-    approved_files: [bundle.file],
-    source_sha256: { [bundle.file]: sourceHash },
+    approved_files: [file],
+    source_sha256: { [file]: sourceHash },
     orchestration_report_sha256: sha256(bundle.reportBytes),
     execution_report_sha256: sha256(bundle.executionReportBytes),
     review_report_sha256: sha256(bundle.reviewBytes!),
@@ -490,7 +506,7 @@ export async function integrateApprovedRun(options: IntegrationOptions): Promise
         !bundle.reviewBytes || sha256(bundle.reviewBytes) !== approval.record.review_report_sha256) {
       throw new Error('An approved run or review report was altered after approval.');
     }
-    patchFiles(bundle.patch, file);
+    patchFiles(bundle.patch, [file]);
     const integrations = await privateStateSubdirectory(identity.root, 'integrations');
     verifiedPatchPath = resolve(integrations, `.${integrationId}.approved.patch`);
     await writeFile(verifiedPatchPath, bundle.patchBytes, { flag: 'wx', mode: 0o600 });

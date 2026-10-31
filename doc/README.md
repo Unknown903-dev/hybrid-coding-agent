@@ -1,6 +1,6 @@
-# Hybrid Coding Agent — Milestone 6B
+# Hybrid Coding Agent — Milestone 6C.1
 
-This project connects a **read-only Cloud Codex supervisor**, a direct **local Ollama proposal/repair worker**, and a **TypeScript policy and execution orchestrator**. Milestone 6A provides one explicitly authorized end-to-end command for a single eligible existing-file task; Milestone 6B adds explicit human approval and controlled application of the exact reviewed patch. It does not schedule multiple tasks, commit, push, merge, deploy, or perform cloud coding.
+This project connects a **read-only Cloud Codex supervisor**, a direct **local Ollama proposal/repair worker**, and a **TypeScript policy and execution orchestrator**. Milestone 6A provides one explicitly authorized end-to-end command for a single eligible existing-file task; Milestone 6B adds explicit human approval and controlled application of the exact reviewed patch; Milestone 6C.1 adds sequential execution of two to five independent existing-file tasks in one isolated worktree. It does not execute dependent tasks, run tasks in parallel, commit, push, merge, deploy, or perform cloud coding.
 
 ## Prerequisites
 
@@ -63,6 +63,28 @@ Available flags are:
 
 Normal execution requires both `--allow-cloud` and `--apply`. A non-dry run without either authorization stops before any model call. There is no fallback to cloud coding when local generation, execution, or repair fails.
 
+### Sequential multi-task mode
+
+```sh
+npm run dev -- run \
+  --project /absolute/path/to/disposable-repository \
+  --task "Update these independent utilities" \
+  --multi-task \
+  --max-tasks 3 \
+  --allow-cloud \
+  --apply
+```
+
+Multi-task mode accepts two through five independent tasks. Every task must be deterministically local-eligible, modify exactly one different verified existing file, have no dependencies, and remain outside protected or high-risk domains. The entire plan is rejected before Ollama or worktree execution if any task is unsupported; the orchestrator never silently executes a subset.
+
+The coordinator acquires all per-file locks in stable order and creates one detached owned worktree. Tasks execute in plan order, so later applications and trusted checks observe earlier worktree changes. Each proposal is generated from the current authorized file, validated against its current SHA-256 digest, and applied through the existing bounded repair coordinator. Model output cannot add files or commands.
+
+Conventional repository-wide validation commands are not assumed safe as per-task checks because a temporarily incomplete multi-task plan may fail them. The CLI therefore defers those checks and repairs until all task proposals have been applied, then runs the complete trusted validation suite once. The programmatic coordinator accepts explicitly scoped `taskCommands`; when supplied, failed task checks may invoke the existing bounded local repair loop. A final combined-check failure never triggers speculative cross-file repair and preserves the shared worktree for inspection.
+
+One combined Git diff, one combined execution report, and one final Cloud supervisor review are produced. Planning and final review share the normal two-call default budget; there is no per-task cloud review or cloud coding fallback. Reports record execution order, task/file scopes, proposal and report references, per-task repair/check outcomes, combined checks, patch SHA-256, Cloud usage/review, worktree cleanup state, and human-approval availability.
+
+For Milestone 6C.1, combined multi-file patches are deliberately **review-only**. `run inspect` displays the complete combined patch and marks it ineligible for signed approval. The Milestone 6B approval/integration path remains restricted to one existing file, so partial or weakened multi-file integration is impossible. Apply multi-file patches manually only after your own review, or wait for a later transactional multi-file integration milestone.
+
 ### Orchestration reports and recovery
 
 Each run atomically maintains `.agent-runs/<run-id>-orchestration.json`. Its versioned schema records lifecycle transitions, plan/task/proposal/report/patch/review references, requested models, shared cloud-call counts, SDK token usage when reported, validation outcomes, review status, failure details, and the permanent human-approval requirement. Unknown token usage is stored as `null`, not fabricated as zero.
@@ -123,8 +145,8 @@ Create a disposable Git repository with an initial commit, one existing source f
 
 ## Next milestones
 
-1. Multi-task scheduling and dependency coordination.
-2. Separately authorized commit, merge, or remote integration workflows.
+1. Transactional signed approval and integration for combined multi-file patches.
+2. Dependent-task scheduling, parallel execution, and separately authorized remote integration.
 
 ## Security
 
@@ -353,10 +375,12 @@ Cloud-hosted inference may consume OpenAI-hosted usage and requires Codex authen
 - Supervisor planning and review remain read-only. The explicitly authorized `run` workflow coordinates one local task but never performs cloud takeover, merging, or deployment.
 - The bounded inventory is intentionally incomplete in very large repositories. If the needed file is omitted, planning reports insufficient context rather than searching outside the allowed context or guessing a path.
 - Source redaction is best effort. The inventory excludes conventional secret locations and credential file types, but repositories should not contain secrets under misleading ordinary source-file names.
-- End-to-end orchestration supports exactly one dependency-free existing-file task. Multi-task plans and create/delete work are saved and blocked rather than partially executed.
+- Default single-task mode still supports exactly one dependency-free existing-file task; create/delete work remains blocked.
+- Sequential multi-task mode supports two to five dependency-free tasks on distinct existing files. Dependencies, overlapping scopes, partial-plan execution, and parallelism are rejected.
 - A Cloud review verdict is advisory. It never starts another repair loop, cloud coding task, merge, commit, push, or deployment.
 - Approval/integration currently supports the same single existing text file as Milestone 6A; binary, mode-changing, rename, creation, and deletion patches are rejected.
 - Integration intentionally leaves the approved change unstaged in the original working tree for manual review and commit.
+- Combined multi-task patches are review-only in Milestone 6C.1 and cannot use signed `run approve` or `run integrate`.
 - Git patch application plus in-process restoration prevents partial-file results during handled failures. An uncatchable process termination or machine failure can still leave the complete approved working-tree diff without a final audit; inspect `git diff` and the local audit directory before retrying.
 
 Run project checks with:

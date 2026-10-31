@@ -12,7 +12,8 @@ export const localRunReportSchema = z.object({
   status: z.enum(['passed', 'failed']),
   task: z.string().max(10_000).optional(),
   model: z.string().max(500).optional(),
-  proposed_file: z.string().trim().min(1).max(1_000),
+  proposed_file: z.string().trim().min(1).max(1_000).optional(),
+  proposed_files: z.array(z.string().trim().min(1).max(1_000)).min(2).max(5).optional(),
   proposal_summary: z.string().max(10_000).optional(),
   structural_validation: z.unknown().optional(),
   application: z.unknown().optional(),
@@ -23,7 +24,14 @@ export const localRunReportSchema = z.object({
   attempts: z.unknown().optional(),
   stop_reason: z.string().max(500).optional(),
   errors: z.array(z.string().max(10_000)).max(100).default([]),
-}).passthrough();
+}).passthrough().superRefine((report, context) => {
+  if (!report.proposed_file && !report.proposed_files) {
+    context.addIssue({ code: 'custom', path: ['proposed_file'], message: 'A run report requires proposed_file or proposed_files.' });
+  }
+  if (report.proposed_file && report.proposed_files) {
+    context.addIssue({ code: 'custom', path: ['proposed_files'], message: 'A run report cannot contain both proposed_file and proposed_files.' });
+  }
+});
 
 export type LocalRunReport = z.infer<typeof localRunReportSchema>;
 
@@ -64,29 +72,37 @@ export async function readRunArtifact(projectRoot: string, input: string): Promi
   }
   const parsed = localRunReportSchema.safeParse(value);
   if (!parsed.success) throw new Error(`Invalid run report: ${parsed.error.issues.map(issue => `${issue.path.join('.')}: ${issue.message}`).join('; ')}`);
-  await resolveSafeTargetPath(projectRoot, parsed.data.proposed_file, ['package.json', '.agent-validation.json']);
+  const proposedFiles = parsed.data.proposed_files ?? (parsed.data.proposed_file ? [parsed.data.proposed_file] : []);
+  for (const file of proposedFiles) await resolveSafeTargetPath(projectRoot, file, ['package.json', '.agent-validation.json']);
   const patchPath = await safeArtifact(projectRoot, `.agent-runs/${parsed.data.task_id}.patch`, MAX_PATCH_BYTES, '.patch');
   const patch = await readFile(patchPath, 'utf8');
-  if (parsed.data.proposed_file) validatePatchScope(patch, parsed.data.proposed_file);
+  validatePatchScope(patch, proposedFiles);
   return { report: parsed.data, patch };
 }
 
-function validatePatchScope(patch: string, expectedFile: string): void {
-  if (isAbsolute(expectedFile) || expectedFile.split(/[\\/]/).includes('..')) throw new Error('Run report contains an unsafe proposed file path.');
-  const normalizedExpected = expectedFile.replaceAll('\\', '/');
-  const segments = normalizedExpected.split('/');
-  const name = (segments.at(-1) ?? '').toLowerCase();
-  if (segments.some(segment => ['.git', '.agent-runs', '.agent-proposals', '.agent-worktrees', '.agent-state', '.aws', '.ssh', '.codex', 'node_modules'].includes(segment.toLowerCase())) ||
-      name === '.env' || name.startsWith('.env.') || /\.(?:pem|key|p12|pfx)$/i.test(name)) {
-    throw new Error('Run report references a protected patch path.');
-  }
+function validatePatchScope(patch: string, expectedFiles: string[]): void {
+  const normalizedExpected = expectedFiles.map(expectedFile => {
+    if (isAbsolute(expectedFile) || expectedFile.split(/[\\/]/).includes('..')) throw new Error('Run report contains an unsafe proposed file path.');
+    const normalized = expectedFile.replaceAll('\\', '/');
+    const segments = normalized.split('/');
+    const name = (segments.at(-1) ?? '').toLowerCase();
+    if (segments.some(segment => ['.git', '.agent-runs', '.agent-proposals', '.agent-worktrees', '.agent-state', '.aws', '.ssh', '.codex', 'node_modules'].includes(segment.toLowerCase())) ||
+        name === '.env' || name.startsWith('.env.') || /\.(?:pem|key|p12|pfx)$/i.test(name)) {
+      throw new Error('Run report references a protected patch path.');
+    }
+    return normalized;
+  });
+  if (new Set(normalizedExpected).size !== normalizedExpected.length) throw new Error('Run report contains duplicate patch paths.');
   const headers = [...patch.matchAll(/^diff --git a\/(.+) b\/(.+)$/gm)];
-  if (headers.length === 0) throw new Error('Patch has no reviewable Git diff header.');
+  if (headers.length !== normalizedExpected.length) throw new Error('Patch scope or file count does not match the run report.');
+  const actual = new Set<string>();
   for (const header of headers) {
-    if (header[1] !== normalizedExpected || header[2] !== normalizedExpected) {
+    if (header[1] !== header[2] || !normalizedExpected.includes(header[1]!)) {
       throw new Error('Patch contains changes outside the report authorized file.');
     }
+    actual.add(header[1]!);
   }
+  if (actual.size !== normalizedExpected.length) throw new Error('Patch does not contain every authorized file exactly once.');
 }
 
 export function sanitizeCloudText(text: string, maxChars: number): string {
@@ -103,6 +119,7 @@ export function summarizedRunReport(report: LocalRunReport): string {
     status: report.status,
     task: report.task,
     proposed_file: report.proposed_file,
+    proposed_files: report.proposed_files,
     proposal_summary: report.proposal_summary,
     structural_validation: report.structural_validation,
     application: report.application,

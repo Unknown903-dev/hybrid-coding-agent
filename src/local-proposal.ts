@@ -60,6 +60,17 @@ function isBlocked(rel: string): boolean {
   });
 }
 
+export async function ensureProposalDirectory(projectRoot: string): Promise<string> {
+  const proposalDir = join(projectRoot, '.agent-proposals');
+  await mkdir(proposalDir, { recursive: true, mode: 0o700 });
+  const stat = await lstat(proposalDir);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('.agent-proposals must be a regular non-symlink directory.');
+  const actual = await realpath(proposalDir);
+  const rel = relative(projectRoot, actual);
+  if (!rel || rel === '..' || rel.startsWith(`..${sep}`)) throw new Error('.agent-proposals escapes the target repository.');
+  return actual;
+}
+
 export async function proposeLocalChange(options: {
   project: string;
   file: string;
@@ -109,8 +120,7 @@ export async function proposeLocalChange(options: {
     throw new Error(`The model did not return the required proposal fields: ${formatSchemaIssues(parsed.error).join('; ')}. Source files were not modified.`);
   }
   const p = parsed.data;
-  const proposalDir = join(projectRoot, '.agent-proposals');
-  await mkdir(proposalDir, { recursive: true });
+  const proposalDir = await ensureProposalDirectory(projectRoot);
   const outputFile = join(proposalDir, `${Date.now()}-${randomUUID()}.json`);
   await writeFile(outputFile, JSON.stringify({ task: options.task, file: rel, model: options.model, summary: p.summary,
     proposed_content: p.proposed_content, checks: p.checks, risks: p.risks,
