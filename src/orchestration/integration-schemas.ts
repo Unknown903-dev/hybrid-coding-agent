@@ -23,6 +23,9 @@ export const approvalRecordSchema = z.object({
   patch_sha256: sha256Schema,
   approved_files: z.array(safeFileSchema).min(1).max(5),
   source_sha256: z.record(safeFileSchema, sha256Schema),
+  file_operations: z.record(safeFileSchema, z.enum(['modify', 'create'])).optional(),
+  resulting_sha256: z.record(safeFileSchema, sha256Schema).optional(),
+  expected_absent: z.array(safeFileSchema).max(5).optional(),
   orchestration_report_sha256: sha256Schema,
   execution_report_sha256: sha256Schema,
   validation_artifact_sha256: sha256Schema.optional(),
@@ -48,6 +51,7 @@ export const integrationAuditSchema = z.object({
   changed_files: z.array(safeFileSchema).max(20),
   original_source_sha256: z.record(safeFileSchema, sha256Schema).optional(),
   resulting_source_sha256: z.record(safeFileSchema, sha256Schema).optional(),
+  file_operations: z.record(safeFileSchema, z.enum(['modify', 'create'])).optional(),
   rollback: z.object({
     attempted: z.boolean(),
     succeeded: z.boolean(),
