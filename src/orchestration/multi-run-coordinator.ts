@@ -136,6 +136,29 @@ function statusFiles(status: string): string[] {
   return [...new Set(files)].sort();
 }
 
+async function newFilePatch(root: string, file: string): Promise<string> {
+  try {
+    await execFileAsync('git', ['-C', root, 'diff', '--no-index', '--binary', '--', '/dev/null', file], {
+      encoding: 'utf8', timeout: 30_000, maxBuffer: 2_000_000,
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+    });
+    throw new Error(`New file patch unexpectedly contains no changes: ${file}`);
+  } catch (error) {
+    const failure = error as NodeJS.ErrnoException & { code?: number; stdout?: string; stderr?: string };
+    if (failure.code !== 1 || !failure.stdout) throw new Error(`Unable to generate new-file patch for ${file}: ${failure.stderr ?? failure.message}`);
+    return failure.stdout;
+  }
+}
+
+async function combinedPatch(root: string, tasks: PlanTask[]): Promise<string> {
+  const modified = tasks.filter(task => task.operation === 'modify_existing').map(task => task.file_scope[0]!).sort();
+  const created = tasks.filter(task => task.operation === 'create').map(task => task.file_scope[0]!).sort();
+  const parts: string[] = [];
+  if (modified.length > 0) parts.push(await git(root, ['diff', '--no-ext-diff', '--binary', '--', ...modified], 2_000_000));
+  for (const file of created) parts.push(await newFilePatch(root, file));
+  return parts.filter(Boolean).join('');
+}
+
 export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOptions): Promise<MultiRunCoordinatorResult> {
   const projectRoot = await repositoryRoot(options.project);
   const request = options.request.trim();
@@ -210,7 +233,7 @@ export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOpti
   const saveCombinedArtifacts = async (tasks: PlanTask[], checks: CheckResult[], status: 'passed' | 'failed', errors: string[]): Promise<void> => {
     if (!worktreeCreated) return;
     const files = tasks.map(task => task.file_scope[0]!);
-    const patch = await git(worktreePath, ['diff', '--no-ext-diff', '--binary', '--', ...files], 2_000_000);
+    const patch = await combinedPatch(worktreePath, tasks);
     if (!patch) return;
     const executionId = randomUUID();
     const patchPath = resolve(projectRoot, '.agent-runs', `${executionId}.patch`);
@@ -218,6 +241,7 @@ export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOpti
     await writeFile(patchPath, patch, { flag: 'wx', mode: 0o600 });
     const executionReport = {
       task_id: executionId, status, task: request, model: localModel, proposed_files: files,
+      proposed_operations: Object.fromEntries(tasks.map(task => [task.file_scope[0]!, task.operation === 'create' ? 'create' : 'modify'])),
       proposal_summary: `Sequential multi-task run containing ${tasks.length} authorized file changes.`,
       structural_validation: { status: 'passed', errors: [], warnings: [] },
       checks: { status: status === 'passed' ? 'passed' : 'failed', results: checks },
@@ -251,7 +275,7 @@ export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOpti
     for (const task of tasks) {
       const finding = planned.plan.routing_policy?.findings.find(item => item.task_id === task.task_id);
       if (!finding?.local_eligible) errors.push(`Task ${task.task_id} is not local-eligible: ${finding?.reasons.join(' ') ?? 'missing routing finding'}`);
-      if (task.operation !== 'modify_existing' || task.file_scope.length !== 1) errors.push(`Task ${task.task_id} is not a one-existing-file modification.`);
+      if (!['modify_existing', 'create'].includes(task.operation) || task.file_scope.length !== 1) errors.push(`Task ${task.task_id} is not a supported one-file modify/create operation.`);
       const file = task.file_scope[0];
       if (file && scopes.has(file)) errors.push(`Multiple tasks target the same file: ${file}.`);
       if (file) scopes.add(file);
@@ -265,11 +289,14 @@ export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOpti
     report.execution_order = tasks.map(task => task.task_id);
     report.task_results = tasks.map((task, index) => ({
       task_id: task.task_id, file: task.file_scope[0]!, order: index + 1,
+      operation: task.operation === 'create' ? 'create' : 'modify',
       dependencies: task.dependencies, authorized_files: [task.file_scope[0]!],
       status: 'pending', proposal_validation: 'not_run', automated_checks: 'not_run', repair_attempts: 0,
     }));
     await transition('plan_validated');
-    for (const task of tasks) await git(projectRoot, ['cat-file', '-e', `HEAD:${task.file_scope[0]}`]);
+    for (const task of tasks) {
+      if (task.operation === 'modify_existing') await git(projectRoot, ['cat-file', '-e', `HEAD:${task.file_scope[0]}`]);
+    }
     if (options.dryRun) {
       await transition('awaiting_human_review', 'Multi-task dry run completed without local generation or execution.');
       return await finish();
@@ -315,10 +342,16 @@ export async function runMultiTaskOrchestration(options: MultiRunCoordinatorOpti
       result.started_at = new Date().toISOString();
       let persistentProposal: string | undefined;
       try {
-        result.source_sha256_before = hash(await readFile(resolve(worktreePath, file)));
+        if (task.operation === 'create') {
+          if (await lstat(resolve(worktreePath, file)).then(() => true, () => false)) throw new Error(`Creation destination unexpectedly exists: ${file}.`);
+          result.expected_absent_before = true;
+        } else {
+          result.source_sha256_before = hash(await readFile(resolve(worktreePath, file)));
+        }
         await transition('local_generating', `Generating task ${index + 1}/${tasks.length}: ${task.task_id}`);
         const worktreeProposal = await proposeLocalChange({
-          project: worktreePath, file, task: await boundedInstruction(request, task, tasksById, worktreePath), model: localModel,
+          project: worktreePath, file, operation: task.operation === 'create' ? 'create' : 'modify',
+          task: await boundedInstruction(request, task, tasksById, worktreePath), model: localModel,
           ...(options.proposalAdapter ? { adapter: options.proposalAdapter } : {}),
         });
         const proposalDirectory = await ensureProposalDirectory(projectRoot);

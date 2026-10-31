@@ -3,6 +3,7 @@ import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { RepositoryInventory } from './inventory.js';
 import { implementationPlanSchema, type ImplementationPlan, type PlanTask, type RoutingFinding } from './schemas.js';
 import { DependencyGraphError, orderTasksByDependencies } from './dependency-graph.js';
+import { resolveSafeCreationPath } from '../proposal-validation.js';
 
 const HIGH_RISK_TAGS = new Set([
   'security', 'authentication', 'authorization', 'billing', 'migration',
@@ -55,10 +56,16 @@ async function routeTask(task: PlanTask, projectRoot?: string): Promise<RoutingF
   if (highRisk) reasons.push('High-risk domain requires cloud or human handling.');
   if (task.complexity === 'complex') reasons.push('Complex tasks are outside the current local-worker boundary.');
   if (task.file_scope.length !== 1) reasons.push('The local worker supports exactly one file per task.');
-  if (task.operation !== 'modify_existing') reasons.push('The local worker cannot create or delete files.');
+  if (task.operation === 'delete') reasons.push('The local worker cannot delete files.');
   if (task.file_scope.some(path => !safeScope(path))) reasons.push('File scope contains a protected or unsafe path.');
   if (task.operation === 'modify_existing' && task.file_scope.length === 1 && !await existingSafeFile(projectRoot, task.file_scope[0]!)) {
     reasons.push('The scoped file is not an existing safe regular file in the target repository.');
+  }
+  if (task.operation === 'create' && (task.risk !== 'low' || task.complexity === 'complex')) reasons.push('New-file creation requires a low-risk, bounded task.');
+  if (task.operation === 'create' && task.file_scope.length === 1 && projectRoot) {
+    await resolveSafeCreationPath(projectRoot, task.file_scope[0]!).catch(error => {
+      reasons.push(`Creation target is not authorized: ${error instanceof Error ? error.message : String(error)}`);
+    });
   }
   if (task.complexity === 'moderate' && (task.acceptance_criteria.length < 2 || task.validation_requirements.length < 1)) {
     reasons.push('Moderate local work requires at least two acceptance criteria and explicit validation.');
