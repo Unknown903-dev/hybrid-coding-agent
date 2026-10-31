@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { access } from 'node:fs/promises';
 import { proposeLocalChange } from './local-proposal.js';
 import { validateProposal, type ValidationReport } from './proposal-validation.js';
+import { executeProposal, type ExecutionReport } from './proposal-execution.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -18,7 +19,9 @@ const usage = `Usage:
   npm run dev -- local --project /path/to/repo --task "bounded change" --apply
   npm run dev -- propose --project /path/to/repo --file src/example.ts --task "bounded change"
   npm run dev -- validate --project /path/to/repo --proposal .agent-proposals/proposal.json
-  npm run dev -- diff --project /path/to/repo --proposal .agent-proposals/proposal.json`;
+  npm run dev -- diff --project /path/to/repo --proposal .agent-proposals/proposal.json
+  npm run dev -- execute --project /path/to/repo --proposal .agent-proposals/proposal.json --apply
+  npm run dev -- execute --project /path/to/repo --proposal .agent-proposals/proposal.json --apply --keep-worktree`;
 
 async function checkProject() {
   await access(resolve(project, '.git')).catch(() => { throw new Error(`Not a Git repository: ${project}`); });
@@ -55,16 +58,48 @@ function printValidationReport(report: ValidationReport): void {
   }
 }
 
+function printExecutionReport(report: ExecutionReport): void {
+  console.log(report.status === 'passed' ? 'EXECUTION PASSED: all configured trusted checks passed.' : 'EXECUTION FAILED.');
+  console.log(`Task ID: ${report.task_id}`);
+  if (report.worktree.location) {
+    console.log(`Worktree: ${report.worktree.location} (${report.worktree.preserved ? 'preserved' : 'cleaned'})`);
+  }
+  console.log(`Structural validation: ${report.structural_validation.status}`);
+  console.log(`Application: ${report.application.status}${report.application.stale ? ' (stale proposal)' : ''}`);
+  console.log(`Automated checks: ${report.checks.status}`);
+  for (const check of report.checks.results) {
+    console.log(`CHECK ${check.status.toUpperCase()}: ${check.name} (exit ${check.exit_code ?? 'none'}, ${check.duration_ms} ms${check.timed_out ? ', timed out' : ''})`);
+  }
+  for (const error of report.errors) console.log(`ERROR: ${error}`);
+  console.log('Human review: required; automated checks do not authorize merge, commit, push, or deployment.');
+  if (report.report_path) console.log(`Report: ${report.report_path}`);
+}
+
 async function main() {
   const taskCommands = ['plan', 'local', 'propose'];
   const proposalCommands = ['validate', 'diff'];
-  if (![...taskCommands, ...proposalCommands].includes(command ?? '') || (taskCommands.includes(command ?? '') && !task)) {
+  const supportedCommands = [...taskCommands, ...proposalCommands, 'execute'];
+  if (!supportedCommands.includes(command ?? '') || (taskCommands.includes(command ?? '') && !task)) {
     console.log(usage);
     process.exitCode = 1;
     return;
   }
   await checkProject();
-  if (proposalCommands.includes(command ?? '')) {
+  if (command === 'execute') {
+    const proposalPath = getArg('--proposal');
+    if (!proposalPath) throw new Error('execute requires --proposal <path>');
+    if (!args.includes('--apply')) throw new Error('execute requires explicit authorization with --apply');
+    const preview = await validateProposal({ project, proposalPath });
+    if (preview.proposal) console.log(`Proposal summary: ${preview.proposal.summary}`);
+    const report = await executeProposal({
+      project,
+      proposalPath,
+      apply: true,
+      keepWorktree: args.includes('--keep-worktree'),
+    });
+    printExecutionReport(report);
+    if (report.status !== 'passed') process.exitCode = 1;
+  } else if (proposalCommands.includes(command ?? '')) {
     const proposalPath = getArg('--proposal');
     if (!proposalPath) throw new Error(`${command} requires --proposal <path>`);
     const report = await validateProposal({
