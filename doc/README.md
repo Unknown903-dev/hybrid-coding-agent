@@ -1,4 +1,4 @@
-# Hybrid Coding Agent — Milestone 3B
+# Hybrid Coding Agent — Milestone 4
 
 Starter integrating a **cloud Codex supervisor (read-only planning)** and a **local Ollama worker through Codex CLI**. This is not yet an automatic multi-agent orchestrator. It deliberately requires explicit steps and protects writes by default.
 
@@ -32,8 +32,8 @@ Review changes with `git diff` and run your tests yourself. Codex tool approvals
 
 ## Next milestones
 
-1. Automated local delegation from cloud plans and escalation policies.
-2. Review checkpoints and model usage budgets.
+1. Cloud supervisor escalation and review checkpoints.
+2. Automated task scheduling and model usage budgets.
 
 ## Security
 
@@ -128,6 +128,48 @@ Each `.agent-runs/<task-id>.json` report records the task/model/file, worktree a
 
 Git worktrees provide source-control separation, not a security sandbox. Tests and compilers execute repository code with the current OS user's permissions and may access the filesystem, network, processes, or credentials available outside the restricted environment variables passed by the orchestrator. Run untrusted repositories only inside a stronger container or VM. This milestone does not install dependencies or perform cloud escalation.
 
+## Bounded local repair workflow
+
+The `repair` command runs an initial proposal and, when trusted checks fail, gives a sanitized failure summary and the current authorized source back to the configured local Ollama model. A corrected proposal is strictly validated and applied in the same detached worktree before checks run again:
+
+```sh
+npm run dev -- repair \
+  --project . \
+  --proposal .agent-proposals/example.json \
+  --apply \
+  --max-retries 2
+```
+
+`--apply` is mandatory. Without explicit authorization the coordinator does not create a worktree, execute checks, or contact Ollama. The default is two repair attempts after the initial attempt; the CLI accepts zero through five. A total time budget is also enforced and can be shortened with `--time-budget-ms`.
+
+Each repair cycle:
+
+1. Revalidates the initial proposal, protected path, and source digest.
+2. Acquires the same per-target lock used by `execute` and creates one owned detached worktree.
+3. Applies only the authorized file and runs configured trusted checks.
+4. Captures bounded, redacted diagnostics, modified-file names, and a diff summary.
+5. Requests a complete corrected file from local Ollama—never commands or additional paths.
+6. Wraps the response in the strict proposal schema, validates it against the current worktree content, and verifies that the file did not change unexpectedly.
+7. Repeats until checks pass or a bounded stop condition is reached.
+
+The coordinator stops early for stale content, protected or unauthorized files, repeated identical proposals, repeated ineffective formatting-only changes with the same error, repeated malformed responses, unexpected check-generated source changes, concurrent execution, timeout, total-budget exhaustion, or retry exhaustion. Failures recommend cloud escalation in the report, but this milestone never contacts a cloud model automatically.
+
+Preserve the repair worktree for debugging with:
+
+```sh
+npm run dev -- repair --proposal .agent-proposals/example.json --apply --keep-worktree
+```
+
+Otherwise only the worktree created by that repair run is removed. User-created worktrees are never pruned or guessed to be stale.
+
+## Repair diagnostics and artifacts
+
+Repair reports are stored as `.agent-runs/<task-id>-repair.json`. They contain attempt number and duration, proposal hash and validity, sanitized model response, checks and exit codes, bounded/redacted output, error fingerprint, modified files, diff summary, retry count, stop reason, and cleanup state. The report separately records proposal validity, automated checks, required semantic review, and whether cloud escalation is recommended.
+
+The final worktree diff is saved as `.agent-runs/<task-id>.patch` before cleanup, including on recoverable failures where a diff exists. Inspect it with any normal patch or diff viewer. A passing report means only that the configured trusted checks passed; it does not prove task correctness or authorize a commit, merge, push, or deployment.
+
+Diagnostics forwarded to Ollama are restricted to the authorized file, failed check names and exit codes, bounded stdout/stderr, modified-file names, and diff counts. Common credential/token patterns are redacted. This is a best-effort leak-reduction measure, not a substitute for keeping secrets out of source and test output.
+
 ## Current limitations
 
 - Validation establishes structure and filesystem safety, not intent or semantic correctness.
@@ -137,6 +179,7 @@ Git worktrees provide source-control separation, not a security sandbox. Tests a
 - Execution supports one existing file and trusted checks; it does not merge accepted changes back into the original tree.
 - Each proposal targets one existing regular file; file creation, deletion, and multi-file proposals are not supported.
 - A process crash may leave an owned worktree or lock for manual inspection; the executor never prunes unknown worktrees or guesses that another process is dead.
+- Repair uses the local Ollama endpoint only. It does not implement cloud supervision, autonomous scheduling, automatic merging, or deployment.
 
 Run project checks with:
 
