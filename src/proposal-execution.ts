@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { mkdir, open, readFile, realpath, rename, unlink, writeFile, type FileHandle } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
-import { generateDiff, resolveSafeTargetPath, validateProposal, type DiffAnalysis, type ValidationReport } from './proposal-validation.js';
+import { generateDiff, resolveSafeCreationPath, resolveSafeTargetPath, validateProposal, type DiffAnalysis, type ValidationReport } from './proposal-validation.js';
 import { loadTrustedCommands, runTrustedCommand, type CheckResult, type TrustedCommand } from './trusted-checks.js';
 
 export const EXECUTION_PROTECTED_PATHS = ['package.json', '.agent-validation.json', '.agent-runs', '.agent-worktrees', '.agent-state'];
@@ -23,6 +23,7 @@ export interface ExecutionReport {
   task?: string;
   model?: string;
   proposed_file?: string;
+  operation?: 'modify' | 'create';
   proposal_summary?: string;
   proposal_path: string;
   worktree: {
@@ -157,6 +158,7 @@ function copyValidation(report: ExecutionReport, validation: ValidationReport): 
     report.task = validation.proposal.task;
     report.model = validation.proposal.model;
     report.proposed_file = validation.proposal.file;
+    report.operation = validation.proposal.operation;
     report.proposal_summary = validation.proposal.summary;
   }
   if (validation.diff) {
@@ -192,10 +194,10 @@ export async function executeProposal(options: ExecutionOptions): Promise<Execut
     if (!validation.valid || !validation.proposal || !validation.diff || !validation.targetPath) {
       throw new Error(`Proposal validation failed: ${validation.errors.join('; ')}`);
     }
-    if (!validation.proposal.original_sha256) {
+    if (validation.proposal.operation === 'modify' && !validation.proposal.original_sha256) {
       throw new Error('Proposal cannot be executed because it has no original_sha256; regenerate this legacy proposal.');
     }
-    if (validation.originalSha256 !== validation.proposal.original_sha256) {
+    if (validation.proposal.operation === 'modify' && validation.originalSha256 !== validation.proposal.original_sha256) {
       report.application.stale = true;
       throw new Error('Proposal is stale: the original source file changed after proposal generation.');
     }
@@ -222,20 +224,26 @@ export async function executeProposal(options: ExecutionOptions): Promise<Execut
     if (!validation.valid || !validation.proposal || !validation.targetPath || !validation.diff) {
       throw new Error(`Proposal revalidation failed: ${validation.errors.join('; ')}`);
     }
-    if (!validation.proposal.original_sha256 || validation.originalSha256 !== validation.proposal.original_sha256) {
+    if (validation.proposal.operation === 'modify' && (!validation.proposal.original_sha256 || validation.originalSha256 !== validation.proposal.original_sha256)) {
       report.application.stale = true;
       throw new Error('Proposal became stale before application; the source file was not written.');
     }
 
-    const worktreeTarget = await resolveSafeTargetPath(worktreePath, validation.proposal.file, EXECUTION_PROTECTED_PATHS);
-    const worktreeOriginal = await readFile(worktreeTarget.path, 'utf8');
-    if (sha256(worktreeOriginal) !== validation.proposal.original_sha256) {
+    const worktreeTarget = validation.proposal.operation === 'create'
+      ? await resolveSafeCreationPath(worktreePath, validation.proposal.file, EXECUTION_PROTECTED_PATHS)
+      : await resolveSafeTargetPath(worktreePath, validation.proposal.file, EXECUTION_PROTECTED_PATHS);
+    const worktreeOriginal = validation.proposal.operation === 'create' ? '' : await readFile(worktreeTarget.path, 'utf8');
+    if (validation.proposal.operation === 'modify' && sha256(worktreeOriginal) !== validation.proposal.original_sha256) {
       report.application.stale = true;
       throw new Error('Proposal base does not match the checked-out HEAD in the isolated worktree.');
     }
 
     report.application = { status: 'failed', stale: false };
-    await writeFile(worktreeTarget.path, validation.proposal.proposed_content, 'utf8');
+    if (validation.proposal.operation === 'create') {
+      await writeFile(worktreeTarget.path, validation.proposal.proposed_content, { flag: 'wx', mode: 0o644, encoding: 'utf8' });
+    } else {
+      await writeFile(worktreeTarget.path, validation.proposal.proposed_content, 'utf8');
+    }
     const appliedDiff = generateDiff(worktreeTarget.relativePath.split(sep).join('/'), worktreeOriginal, validation.proposal.proposed_content);
     if (appliedDiff.changedLines !== validation.diff.changedLines) {
       throw new Error('Applied diff did not match the revalidated proposal.');
