@@ -150,6 +150,28 @@ function printRunInspection(inspection: RunInspection): void {
   console.log(`Run ID: ${inspection.runId}`);
   console.log(`Original task: ${inspection.task}`);
   console.log(`Changed files: ${inspection.changedFiles.join(', ')}`);
+  if (inspection.selectedTasks.length > 0) {
+    console.log('Selected tasks:');
+    for (const task of inspection.selectedTasks) console.log(`  ${task.taskId}: ${task.file}`);
+  }
+  if (inspection.executionOrder.length > 0) console.log(`Execution order: ${inspection.executionOrder.join(' -> ')}`);
+  if (inspection.taskOutcomes.length > 0) {
+    console.log('Task outcomes:');
+    for (const outcome of inspection.taskOutcomes) {
+      console.log(`  ${outcome.task_id} (${outcome.file}): ${outcome.status}; proposal=${outcome.proposal_validation}; checks=${outcome.automated_checks}; repairs=${outcome.repair_attempts}`);
+    }
+  }
+  if (inspection.finalValidation) {
+    console.log(`Final combined validation: ${inspection.finalValidation.status}`);
+    for (const [index, result] of inspection.finalValidation.results.entries()) {
+      const check = result && typeof result === 'object' ? result as Record<string, unknown> : {};
+      const name = typeof check.name === 'string' ? check.name : `check ${index + 1}`;
+      const status = typeof check.status === 'string' ? check.status : 'unknown';
+      const exit = typeof check.exit_code === 'number' || check.exit_code === null ? `; exit=${String(check.exit_code)}` : '';
+      const timeout = check.timed_out === true ? '; timed out' : '';
+      console.log(`  ${name}: ${status}${exit}${timeout}`);
+    }
+  }
   console.log(`Diff summary: +${inspection.diffSummary.addedLines} -${inspection.diffSummary.removedLines} (${inspection.diffSummary.changedLines} changed lines)`);
   console.log(`Patch SHA-256: ${inspection.diffSummary.patchSha256}`);
   console.log(`Automated validation: plan=${inspection.automatedValidation.plan}, proposal=${inspection.automatedValidation.proposal}, checks=${inspection.automatedValidation.automated_checks}`);
