@@ -11,14 +11,18 @@ import { readPlanArtifact } from './supervisor/artifacts.js';
 import { buildRepositoryInventory } from './supervisor/inventory.js';
 import { validateAndEnforcePlan } from './supervisor/routing.js';
 import type { ImplementationPlan } from './supervisor/schemas.js';
+import { runOrchestration } from './orchestration/run-coordinator.js';
+import type { OrchestrationReport } from './orchestration/schemas.js';
+import { approveOrchestrationRun, inspectOrchestrationRun, integrateApprovedRun, type RunInspection } from './orchestration/integration.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
 const getArg = (name: string) => { const i = args.indexOf(name); return i === -1 ? undefined : args[i + 1]; };
 const project = resolve(getArg('--project') ?? '.');
 const task = getArg('--task');
-const model = process.env.LOCAL_MODEL ?? 'qwen2.5-coder:7b';
+const model = getArg('--model') ?? process.env.LOCAL_MODEL ?? 'qwen2.5-coder:7b';
 const supervisorCommand = command === 'supervisor' ? args[1] : undefined;
+const runSubcommand = command === 'run' && ['inspect', 'approve', 'integrate'].includes(args[1] ?? '') ? args[1] : undefined;
 
 const usage = `Usage:
   npm run dev -- plan --project /path/to/repo --task "feature description" --allow-cloud
@@ -31,6 +35,11 @@ const usage = `Usage:
   npm run dev -- execute --project /path/to/repo --proposal .agent-proposals/proposal.json --apply --keep-worktree
   npm run dev -- repair --project /path/to/repo --proposal .agent-proposals/proposal.json --apply --max-retries 2
   npm run dev -- repair --project /path/to/repo --proposal .agent-proposals/proposal.json --apply --keep-worktree
+  npm run dev -- run --project /path/to/repo --task "bounded change" --allow-cloud --apply
+  npm run dev -- run --project /path/to/repo --task "bounded change" --allow-cloud --dry-run
+  npm run dev -- run inspect --project /path/to/repo --run-id <run-id>
+  npm run dev -- run approve --project /path/to/repo --run-id <run-id> --yes
+  npm run dev -- run integrate --project /path/to/repo --run-id <run-id>
   npm run dev -- supervisor plan --project /path/to/repo --task "feature request" --allow-cloud
   npm run dev -- supervisor inspect --project /path/to/repo --plan .agent-runs/plan-supervisor-plan.json
   npm run dev -- supervisor review --project /path/to/repo --report .agent-runs/task-repair.json --allow-cloud`;
@@ -113,6 +122,48 @@ function printRepairReport(report: RepairReport): void {
   if (report.report_path) console.log(`Report: ${report.report_path}`);
 }
 
+function printOrchestrationReport(report: OrchestrationReport, path: string): void {
+  console.log(`Orchestration state: ${report.state}`);
+  console.log(`Run ID: ${report.run_id}`);
+  if (report.selected_task) console.log(`Selected task: ${report.selected_task.task_id} (${report.selected_task.file_scope.join(', ')})`);
+  console.log(`Plan validation: ${report.validation.plan}`);
+  console.log(`Proposal validation: ${report.validation.proposal}`);
+  console.log(`Automated checks: ${report.validation.automated_checks}`);
+  console.log(`Cloud calls: ${report.cloud_usage.calls_started}/${report.cloud_usage.call_budget}`);
+  console.log(`Cloud review: ${report.final_review.status}${report.final_review.verdict ? ` (${report.final_review.verdict})` : ''}`);
+  if (report.final_patch_path) console.log(`Reviewable patch: ${report.final_patch_path}`);
+  if (report.failure_reason) console.log(`STATUS DETAIL: ${report.failure_reason}`);
+  console.log('Human approval: required. No commit, merge, push, deployment, or original-tree source write was performed.');
+  console.log(`Orchestration report: ${path}`);
+}
+
+function printRunInspection(inspection: RunInspection): void {
+  console.log(`Run ID: ${inspection.runId}`);
+  console.log(`Original task: ${inspection.task}`);
+  console.log(`Changed files: ${inspection.changedFiles.join(', ')}`);
+  console.log(`Diff summary: +${inspection.diffSummary.addedLines} -${inspection.diffSummary.removedLines} (${inspection.diffSummary.changedLines} changed lines)`);
+  console.log(`Patch SHA-256: ${inspection.diffSummary.patchSha256}`);
+  console.log(`Automated validation: plan=${inspection.automatedValidation.plan}, proposal=${inspection.automatedValidation.proposal}, checks=${inspection.automatedValidation.automated_checks}`);
+  console.log(`Cloud review: ${inspection.cloudReviewVerdict ?? 'unavailable'}`);
+  console.log(`Cloud usage: ${inspection.cloudUsage.calls_started}/${inspection.cloudUsage.call_budget} calls started; token usage ${inspection.cloudUsage.token_usage ? JSON.stringify(inspection.cloudUsage.token_usage) : 'unknown'}`);
+  for (const warning of inspection.warnings) console.log(`WARNING: ${warning}`);
+  for (const reason of inspection.ineligibilityReasons) console.log(`INELIGIBLE: ${reason}`);
+  console.log(`Eligible for approval: ${inspection.eligibleForApproval ? 'yes' : 'no'}`);
+  process.stdout.write(`\n${inspection.patch}${inspection.patch.endsWith('\n') ? '' : '\n'}`);
+}
+
+async function confirmApproval(runId: string, patchSha256: string): Promise<boolean> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return false;
+  const { createInterface } = await import('node:readline/promises');
+  const prompt = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await prompt.question(`Approve run ${runId}, patch ${patchSha256}? Type "approve": `);
+    return answer.trim() === 'approve';
+  } finally {
+    prompt.close();
+  }
+}
+
 function printPlan(plan: ImplementationPlan): void {
   console.log(`Plan ${plan.plan_id}: ${plan.summary}`);
   console.log(`Repository context: ${plan.context_status} — ${plan.context_notes}`);
@@ -180,14 +231,59 @@ async function runSupervisor(): Promise<void> {
 async function main() {
   const taskCommands = ['plan', 'local', 'propose'];
   const proposalCommands = ['validate', 'diff'];
-  const supportedCommands = [...taskCommands, ...proposalCommands, 'execute', 'repair', 'supervisor'];
-  if (!supportedCommands.includes(command ?? '') || (taskCommands.includes(command ?? '') && !task)) {
+  const supportedCommands = [...taskCommands, ...proposalCommands, 'execute', 'repair', 'run', 'supervisor'];
+  if (!supportedCommands.includes(command ?? '') || ((taskCommands.includes(command ?? '') || (command === 'run' && !runSubcommand)) && !task)) {
     console.log(usage);
     process.exitCode = 1;
     return;
   }
   await checkProject();
-  if (command === 'supervisor') {
+  if (command === 'run') {
+    if (runSubcommand) {
+      const runId = getArg('--run-id');
+      if (!runId) throw new Error(`run ${runSubcommand} requires --run-id <run-id>`);
+      if (runSubcommand === 'inspect') {
+        printRunInspection(await inspectOrchestrationRun(project, runId));
+      } else if (runSubcommand === 'approve') {
+        const inspection = await inspectOrchestrationRun(project, runId);
+        printRunInspection(inspection);
+        if (!inspection.eligibleForApproval) throw new Error('This run is not eligible for approval.');
+        const explicit = args.includes('--yes');
+        const authorized = explicit || await confirmApproval(runId, inspection.diffSummary.patchSha256);
+        const approved = await approveOrchestrationRun({
+          project, runId, authorized,
+          authorizationMethod: explicit ? 'explicit_flag' : 'interactive_confirmation',
+        });
+        console.log(`Approved exact patch ${approved.record.patch_sha256}`);
+        console.log(`Approval record: ${approved.approvalPath}`);
+        console.log('No source files were modified. Approval is not proof of semantic correctness.');
+      } else {
+        const integrated = await integrateApprovedRun({ project, runId });
+        console.log(`Integrated approved patch ${integrated.audit.patch_sha256} into the working tree.`);
+        console.log(`Changed files: ${integrated.audit.changed_files.join(', ')}`);
+        console.log(`Integration audit: ${integrated.auditPath}`);
+        console.log('No commit, push, merge, or deployment was performed. Review the working-tree diff before committing.');
+      }
+    } else {
+      const result = await runOrchestration({
+        project,
+        request: task!,
+        apply: args.includes('--apply'),
+        cloudAuthorized: cloudAuthorized(),
+        dryRun: args.includes('--dry-run'),
+        localModel: model,
+        cloudModel: getArg('--cloud-model'),
+        maxRetries: optionalInteger('--max-retries'),
+        maxCloudCalls: optionalInteger('--max-cloud-calls'),
+        keepWorktree: args.includes('--keep-worktree'),
+      });
+      printOrchestrationReport(result.report, result.reportPath);
+      const successfulDryRun = result.report.dry_run && result.report.state === 'awaiting_human_review';
+      const successfulRun = result.report.validation.automated_checks === 'passed' &&
+        result.report.final_review.status === 'completed' && result.report.final_review.verdict === 'ready_for_human_review';
+      if (!successfulDryRun && !successfulRun) process.exitCode = 1;
+    }
+  } else if (command === 'supervisor') {
     await runSupervisor();
   } else if (command === 'repair') {
     const proposalPath = getArg('--proposal');
