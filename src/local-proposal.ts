@@ -4,11 +4,60 @@ import { createHash, randomUUID } from 'node:crypto';
 import { formatSchemaIssues, proposalSchema } from './proposal-schema.js';
 
 const MAX_FILE_BYTES = 40_000;
-const BLOCKED = new Set(['.env', '.git', 'node_modules', '.ssh', '.aws', '.codex', 'dist', 'build', 'coverage']);
+const BLOCKED = new Set(['.env', '.git', '.agent-state', 'node_modules', '.ssh', '.aws', '.codex', 'dist', 'build', 'coverage']);
+
+export interface LocalProposalRequest {
+  task: string;
+  file: string;
+  model: string;
+  originalContent: string;
+  timeoutMs: number;
+}
+
+export interface LocalProposalAdapter {
+  requestProposal(request: LocalProposalRequest): Promise<unknown>;
+}
+
+export class OllamaProposalAdapter implements LocalProposalAdapter {
+  async requestProposal(request: LocalProposalRequest): Promise<unknown> {
+    const endpoint = process.env.OLLAMA_URL ?? 'http://127.0.0.1:11434';
+    const response = await fetch(new URL('/api/chat', endpoint), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      signal: AbortSignal.timeout(Math.min(request.timeoutMs, 180_000)),
+      body: JSON.stringify({
+        model: request.model,
+        stream: false,
+        format: 'json',
+        messages: [
+          { role: 'system', content: `You are a cautious coding assistant producing an untrusted code proposal.
+Respond with one JSON object containing exactly these keys: summary (non-empty string), proposed_content (string), checks (array of non-empty strings), risks (array of non-empty strings).
+Rules:
+- Modify only code directly required by the assigned task.
+- Preserve existing behavior, imports, exports, and public interfaces unless the task explicitly requires changing them.
+- Avoid unrelated cleanup, comments, renaming, and formatting changes.
+- proposed_content must contain the COMPLETE file text, never a patch or markdown fence.
+- Never claim a test, typecheck, lint, or command passed: you are not given execution results. State that checks were not run when relevant.
+- If no meaningful improvement is needed, return the original content unchanged and say so in summary; validation will record this as a deliberate no-change result.
+- Do not invent other files, commands to execute, tool calls, validation results, or facts about the repository.` },
+          { role: 'user', content: `Task: ${request.task}\nTarget file: ${request.file}\nOriginal file content:\n${request.originalContent}` },
+        ],
+      }),
+    });
+    if (!response.ok) throw new Error(`Ollama HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
+    const data = await response.json() as { message?: { content?: string } };
+    const raw = data.message?.content;
+    if (!raw) throw new Error('Ollama returned an empty message.');
+    return raw;
+  }
+}
 
 function isBlocked(rel: string): boolean {
   const segments = rel.split(sep);
-  return segments.some(segment => BLOCKED.has(segment) || segment.startsWith('.env.') || /\.(pem|key|p12|pfx)$/i.test(segment));
+  return segments.some(segment => {
+    const normalized = segment.toLowerCase();
+    return BLOCKED.has(normalized) || normalized.startsWith('.env.') || /\.(pem|key|p12|pfx)$/i.test(normalized);
+  });
 }
 
 export async function proposeLocalChange(options: {
@@ -16,6 +65,8 @@ export async function proposeLocalChange(options: {
   file: string;
   task: string;
   model: string;
+  timeoutMs?: number;
+  adapter?: LocalProposalAdapter;
 }): Promise<string> {
   const projectRoot = await realpath(options.project);
   if (isAbsolute(options.file) || win32.isAbsolute(options.file) || options.file.split(/[\\/]/).includes('..')) {
@@ -38,35 +89,21 @@ export async function proposeLocalChange(options: {
   const content = await readFile(targetRealPath, 'utf8');
   if (content.includes('\u0000')) throw new Error('Binary files are not supported.');
 
-  const endpoint = process.env.OLLAMA_URL ?? 'http://127.0.0.1:11434';
-  const response = await fetch(new URL('/api/chat', endpoint), {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    signal: AbortSignal.timeout(180_000),
-    body: JSON.stringify({
-      model: options.model,
-      stream: false,
-      format: 'json',
-      messages: [
-        { role: 'system', content: `You are a cautious coding assistant producing an untrusted code proposal.
-Respond with one JSON object containing exactly these keys: summary (non-empty string), proposed_content (string), checks (array of non-empty strings), risks (array of non-empty strings).
-Rules:
-- Modify only code directly required by the assigned task.
-- Preserve existing behavior, imports, exports, and public interfaces unless the task explicitly requires changing them.
-- Avoid unrelated cleanup, comments, renaming, and formatting changes.
-- proposed_content must contain the COMPLETE file text, never a patch or markdown fence.
-- Never claim a test, typecheck, lint, or command passed: you are not given execution results. State that checks were not run when relevant.
-- If no meaningful improvement is needed, return the original content unchanged and say so in summary; validation will record this as a deliberate no-change result.
-- Do not invent other files, commands to execute, tool calls, validation results, or facts about the repository.` },
-        { role: 'user', content: `Task: ${options.task}\nTarget file: ${rel}\nOriginal file content:\n${content}` }
-      ]
-    })
+  const raw = await (options.adapter ?? new OllamaProposalAdapter()).requestProposal({
+    task: options.task,
+    file: rel,
+    model: options.model,
+    originalContent: content,
+    timeoutMs: options.timeoutMs ?? 180_000,
   });
-  if (!response.ok) throw new Error(`Ollama HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
-  const data = await response.json() as { message?: { content?: string } };
-  const raw = data.message?.content;
-  if (!raw) throw new Error('Ollama returned an empty message.');
-  const modelOutput: unknown = JSON.parse(raw);
+  let modelOutput: unknown = raw;
+  if (typeof raw === 'string') {
+    try {
+      modelOutput = JSON.parse(raw);
+    } catch (error) {
+      throw new Error(`The model returned malformed proposal JSON: ${error instanceof Error ? error.message : String(error)}. Source files were not modified.`);
+    }
+  }
   const parsed = proposalSchema.pick({ summary: true, proposed_content: true, checks: true, risks: true }).strict().safeParse(modelOutput);
   if (!parsed.success) {
     throw new Error(`The model did not return the required proposal fields: ${formatSchemaIssues(parsed.error).join('; ')}. Source files were not modified.`);

@@ -150,6 +150,7 @@ export interface RepairCoordinatorOptions {
   totalTimeBudgetMs?: number;
   commands?: TrustedCommand[];
   adapter?: RepairModelAdapter;
+  onRepairStart?: () => void | Promise<void>;
 }
 
 interface ProcessResult {
@@ -503,6 +504,7 @@ export async function coordinateRepair(options: RepairCoordinatorOptions): Promi
       if (retryCount >= maxRetries) fail('retry_budget_exhausted', `Trusted checks still fail after ${retryCount} repair attempt(s).`);
       if (remainingTime() <= 0) fail('time_budget_exceeded', 'Repair exceeded its total time budget before requesting a correction.');
 
+      if (retryCount === 0) await options.onRepairStart?.();
       const diagnostics = diagnosticsFor(attempt);
       attempt.diagnostics_forwarded = diagnostics;
       let raw: unknown;
