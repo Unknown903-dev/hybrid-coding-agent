@@ -1,12 +1,20 @@
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { LocalProposalAdapter, LocalProposalRequest } from '../src/local-proposal.js';
-import { approveOrchestrationRun, inspectOrchestrationRun } from '../src/orchestration/integration.js';
+import {
+  approveOrchestrationRun,
+  inspectOrchestrationRun,
+  integrateApprovedRun,
+  type PatchApplicationAdapter,
+} from '../src/orchestration/integration.js';
+import { integrationAuditSchema } from '../src/orchestration/integration-schemas.js';
 import { runMultiTaskOrchestration, type MultiRunCoordinatorOptions } from '../src/orchestration/multi-run-coordinator.js';
+import { acquireExecutionLock, releaseExecutionLock } from '../src/proposal-execution.js';
 import type { RepairModelAdapter, RepairRequest } from '../src/repair-coordinator.js';
 import type { CodexSupervisorAdapter, SupervisorAdapterRequest, SupervisorAdapterResponse } from '../src/supervisor/codex-supervisor.js';
 import type { TrustedCommand } from '../src/trusted-checks.js';
@@ -294,16 +302,132 @@ describe('sequential multi-task orchestration', () => {
     expect(supervisor.requests).toHaveLength(1);
   });
 
-  it('makes combined patches reviewable but not approvable in Milestone 6C.1', async () => {
+  it('inspects and signs a complete multi-file approval without changing source', async () => {
     const root = await repository();
     const result = await runMultiTaskOrchestration(baseOptions(root));
     const inspection = await inspectOrchestrationRun(root, result.report.run_id);
     expect(inspection.changedFiles).toEqual(['calculator.ts', 'formatter.ts']);
+    expect(inspection.selectedTasks.map(item => item.file)).toEqual(['calculator.ts', 'formatter.ts']);
+    expect(inspection.executionOrder).toEqual(['fix_calculator', 'update_formatter']);
+    expect(inspection.taskOutcomes).toHaveLength(2);
+    expect(inspection.finalValidation?.status).toBe('passed');
     expect(inspection.patch).toContain('calculator.ts');
-    expect(inspection.eligibleForApproval).toBe(false);
-    expect(inspection.ineligibilityReasons.join(' ')).toContain('review-only');
-    await expect(approveOrchestrationRun({
+    expect(inspection.eligibleForApproval).toBe(true);
+    const cli = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
+    const loader = fileURLToPath(new URL('../node_modules/tsx/dist/loader.mjs', import.meta.url));
+    const cliOutput = (await execFileAsync(process.execPath, [
+      '--import', loader, cli, 'run', 'inspect', '--project', root, '--run-id', result.report.run_id,
+    ], { cwd: root, env: { ...process.env, SUPERVISOR_CLOUD_ENABLED: '' } })).stdout;
+    expect(cliOutput).toContain('Selected tasks:');
+    expect(cliOutput).toContain('Execution order: fix_calculator -> update_formatter');
+    expect(cliOutput).toContain('Final combined validation: passed');
+    const approved = await approveOrchestrationRun({
       project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag',
-    })).rejects.toThrow(/not eligible/i);
+    });
+    expect(approved.record.approved_files).toEqual(['calculator.ts', 'formatter.ts']);
+    expect(Object.keys(approved.record.source_sha256).sort()).toEqual(approved.record.approved_files);
+    expect(approved.record.validation_artifact_sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(await readFile(join(root, 'calculator.ts'), 'utf8')).toBe(calculatorOriginal);
+    expect(await readFile(join(root, 'formatter.ts'), 'utf8')).toBe(formatterOriginal);
+    expect(await git(root, ['status', '--porcelain', '--untracked-files=all'])).toBe('');
+  });
+
+  it('transactionally integrates both approved files without creating Git history', async () => {
+    const root = await repository();
+    const head = await git(root, ['rev-parse', 'HEAD']);
+    const result = await runMultiTaskOrchestration(baseOptions(root));
+    await approveOrchestrationRun({ project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag' });
+    const integrated = await integrateApprovedRun({ project: root, runId: result.report.run_id });
+    expect(integrated.audit.status).toBe('succeeded');
+    expect(integrated.audit.changed_files).toEqual(['calculator.ts', 'formatter.ts']);
+    expect(integrated.audit.original_source_sha256 && Object.keys(integrated.audit.original_source_sha256).sort())
+      .toEqual(['calculator.ts', 'formatter.ts']);
+    expect(integrated.audit.resulting_source_sha256 && Object.keys(integrated.audit.resulting_source_sha256).sort())
+      .toEqual(['calculator.ts', 'formatter.ts']);
+    expect(integrated.audit.rollback).toEqual({ attempted: false, succeeded: true, manual_recovery_required: false, affected_paths: [] });
+    expect(await readFile(join(root, 'calculator.ts'), 'utf8')).toBe(calculatorFixed);
+    expect(await readFile(join(root, 'formatter.ts'), 'utf8')).toBe(formatterFixed);
+    expect(await git(root, ['rev-parse', 'HEAD'])).toBe(head);
+    expect(await git(root, ['diff', '--name-only'])).toBe('calculator.ts\nformatter.ts\n');
+    expect(integrated.audit.commit_created || integrated.audit.push_performed || integrated.audit.merge_performed || integrated.audit.deployment_performed).toBe(false);
+    await expect(integrateApprovedRun({ project: root, runId: result.report.run_id })).rejects.toThrow(/already integrated/i);
+  });
+
+  it('rejects stale or dirty state in either approved file before application', async () => {
+    const root = await repository();
+    const result = await runMultiTaskOrchestration(baseOptions(root));
+    await approveOrchestrationRun({ project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag' });
+    await writeFile(join(root, 'formatter.ts'), 'export const stale = true;\n');
+    await expect(integrateApprovedRun({ project: root, runId: result.report.run_id })).rejects.toThrow(/tracked changes|stale/i);
+    expect(await readFile(join(root, 'calculator.ts'), 'utf8')).toBe(calculatorOriginal);
+  });
+
+  it('rolls back every approved file and an unexpected third-file change', async () => {
+    const root = await repository();
+    const result = await runMultiTaskOrchestration(baseOptions(root));
+    await approveOrchestrationRun({ project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag' });
+    const unsafe: PatchApplicationAdapter = { apply: async projectRoot => {
+      await writeFile(join(projectRoot, 'calculator.ts'), calculatorFixed);
+      await writeFile(join(projectRoot, 'formatter.ts'), formatterFixed);
+      await writeFile(join(projectRoot, '.gitignore'), 'unexpected\n');
+    } };
+    await expect(integrateApprovedRun({ project: root, runId: result.report.run_id, adapter: unsafe })).rejects.toThrow(/outside the approved scope/i);
+    expect(await readFile(join(root, 'calculator.ts'), 'utf8')).toBe(calculatorOriginal);
+    expect(await readFile(join(root, 'formatter.ts'), 'utf8')).toBe(formatterOriginal);
+    expect(await readFile(join(root, '.gitignore'), 'utf8')).toContain('.agent-runs/');
+    expect(await git(root, ['status', '--porcelain', '--untracked-files=all'])).toBe('');
+  });
+
+  it('rolls back the first file when application fails while processing the second', async () => {
+    const root = await repository();
+    const result = await runMultiTaskOrchestration(baseOptions(root));
+    await approveOrchestrationRun({ project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag' });
+    const interrupted: PatchApplicationAdapter = { apply: async projectRoot => {
+      await writeFile(join(projectRoot, 'calculator.ts'), calculatorFixed);
+      await writeFile(join(projectRoot, 'formatter.ts'), 'partial\n');
+      throw new Error('second-file application failed');
+    } };
+    await expect(integrateApprovedRun({ project: root, runId: result.report.run_id, adapter: interrupted })).rejects.toThrow(/second-file/);
+    expect(await readFile(join(root, 'calculator.ts'), 'utf8')).toBe(calculatorOriginal);
+    expect(await readFile(join(root, 'formatter.ts'), 'utf8')).toBe(formatterOriginal);
+    expect(await git(root, ['status', '--porcelain', '--untracked-files=all'])).toBe('');
+    const names = await readdir(join(root, '.agent-state', 'integrations'));
+    const audit = integrationAuditSchema.parse(JSON.parse(await readFile(join(root, '.agent-state', 'integrations', names[0]!), 'utf8')));
+    expect(audit.rollback).toEqual({ attempted: true, succeeded: true, manual_recovery_required: false, affected_paths: ['calculator.ts', 'formatter.ts'] });
+  });
+
+  it('acquires overlapping locks deterministically and releases earlier locks after failure', async () => {
+    const root = await repository();
+    const result = await runMultiTaskOrchestration(baseOptions(root));
+    await approveOrchestrationRun({ project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag' });
+    const canonical = await realpath(root);
+    const formatterLock = await acquireExecutionLock(canonical, `${canonical}\0formatter.ts`, 'external');
+    try {
+      await expect(integrateApprovedRun({ project: root, runId: result.report.run_id })).rejects.toThrow(/Another execution/i);
+      const calculatorLock = await acquireExecutionLock(canonical, `${canonical}\0calculator.ts`, 'probe');
+      await releaseExecutionLock(calculatorLock);
+    } finally {
+      await releaseExecutionLock(formatterLock);
+    }
+    expect(await readFile(join(root, 'calculator.ts'), 'utf8')).toBe(calculatorOriginal);
+  });
+
+  it('records explicit manual-recovery state when complete rollback is impossible', async () => {
+    const root = await repository();
+    const result = await runMultiTaskOrchestration(baseOptions(root));
+    await approveOrchestrationRun({ project: root, runId: result.report.run_id, authorized: true, authorizationMethod: 'explicit_flag' });
+    const destructive: PatchApplicationAdapter = { apply: async projectRoot => {
+      await writeFile(join(projectRoot, 'calculator.ts'), calculatorFixed);
+      await rm(join(projectRoot, 'formatter.ts'));
+      await mkdir(join(projectRoot, 'formatter.ts'));
+      throw new Error('simulated filesystem failure');
+    } };
+    await expect(integrateApprovedRun({ project: root, runId: result.report.run_id, adapter: destructive })).rejects.toThrow(/Manual recovery required/i);
+    const names = await readdir(join(root, '.agent-state', 'integrations'));
+    const audit = integrationAuditSchema.parse(JSON.parse(await readFile(join(root, '.agent-state', 'integrations', names[0]!), 'utf8')));
+    expect(audit.status).toBe('failed');
+    expect(audit.rollback?.attempted).toBe(true);
+    expect(audit.rollback?.succeeded).toBe(false);
+    expect(audit.rollback?.manual_recovery_required).toBe(true);
   });
 });

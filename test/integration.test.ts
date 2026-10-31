@@ -260,6 +260,22 @@ describe('human approval and controlled integration', () => {
     expect(await readFile(join(root, 'other.ts'), 'utf8')).toBe('export const other = true;\n');
   });
 
+  it('rejects unsupported mode and submodule patch operations', async () => {
+    const modeRoot = await repository();
+    const modeRun = await completedRun(modeRoot);
+    const modeReport = JSON.parse(await readFile(modeRun.reportPath, 'utf8')) as { final_patch_path: string };
+    const modePatch = await readFile(modeReport.final_patch_path, 'utf8');
+    await writeFile(modeReport.final_patch_path, modePatch.replace('--- a/calculator.ts', 'old mode 100644\nnew mode 100755\n--- a/calculator.ts'));
+    await expect(inspectOrchestrationRun(modeRoot, modeRun.runId)).rejects.toThrow(/unsupported|mode-changing/i);
+
+    const submoduleRoot = await repository();
+    const submoduleRun = await completedRun(submoduleRoot);
+    const submoduleReport = JSON.parse(await readFile(submoduleRun.reportPath, 'utf8')) as { final_patch_path: string };
+    const submodulePatch = await readFile(submoduleReport.final_patch_path, 'utf8');
+    await writeFile(submoduleReport.final_patch_path, submodulePatch.replace(/^index .+$/m, 'index 1111111..2222222 160000'));
+    await expect(inspectOrchestrationRun(submoduleRoot, submoduleRun.runId)).rejects.toThrow(/unsupported|submodule/i);
+  });
+
   it('detects and rolls back unexpected files changed by the application step', async () => {
     const root = await repository();
     const { runId } = await completedRun(root);
